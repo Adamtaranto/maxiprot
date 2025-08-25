@@ -1,43 +1,22 @@
-Got it—here’s the full source for **`maxiprot`**. Save it to a file named `maxiprot` (no extension is fine), then `chmod +x maxiprot` to run.
-
-```python
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Pick the best miniprot alignment per locus from a miniprot GFF3.
 
+Default outputs:
+- GFF3 → **stdout** (unless --out-gff3 PATH is provided)
+- TSV  → **stderr** (unless --out-tsv PATH is provided)
+
 This tool reads a miniprot GFF3 that includes ``##PAF`` header lines, computes
 alignment metrics, applies user-configurable scoring and gating, clusters
 alignments into loci on the same sequence/strand, and selects one "best" or
-"longest" candidate per locus. It writes two outputs:
+"longest" candidate per locus.
 
-1. A GFF3 file with a valid gene → mRNA → CDS hierarchy for the chosen
-   candidate in each locus. Multi-line CDS features **share the same ID**,
+Outputs
+-------
+1) A GFF3 (to stdout by default) with a valid gene → mRNA → CDS hierarchy for
+   the chosen candidate in each locus. Multi-line CDS features **share the same ID**,
    as required by the GFF3 specification.
-2. A TSV summary with one row per chosen locus.
-
-The script maintains *pseudogene* candidates (frame-shifts or premature stops)
-unless the selection policy explicitly prefers intact candidates and one is
-available.
-
-Examples
---------
-Best-scoring per locus, prefer intact models when available:
-
-.. code-block:: bash
-
-    ./maxiprot input.gff3 \
-      --score-mode pid_cov_len --w-pid 1.0 --w-cov 1.0 --w-len 1.0 --length-metric aa \
-      --selection-mode prefer_intact \
-      --min-cov 0.60 --min-pid 0.30 \
-      --locus-pad 6000 \
-      --out-gff3 best_per_locus.gff3 --out-tsv best_per_locus.tsv
-
-Read from stdin and write minimal outputs:
-
-.. code-block:: bash
-
-    cat input.gff3 | ./maxiprot - \
-      --out-gff3 best.gff3 --out-tsv best.tsv
+2) A TSV summary (to stderr by default) with one row per chosen locus.
 
 Notes
 -----
@@ -54,11 +33,11 @@ import math
 import re
 import sys
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, TextIO
 
 import pandas as pd
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"  # default outputs: GFF3→stdout, TSV→stderr
 
 
 # ---------------------------------------------------------------------------
@@ -81,10 +60,10 @@ class ParsedCg:
     Parameters
     ----------
     M, I, D, G : int
-        Amino acid operation lengths for Match, Insertion, Deletion, and 'G' (alignment op).
+        Amino acid operation lengths for Match, Insertion, Deletion, and 'G'.
         We treat M/I/D/G as contributing to aligned AA length.
     intron_nt : int
-        Total intronic nucleotides (e.g., from N/U/V ops) for reporting; not used directly in scoring.
+        Total intronic nucleotides (N/U/V ops) for reporting; not used in scoring.
     """
     M: int = 0
     I: int = 0
@@ -98,18 +77,7 @@ class ParsedCg:
 # ---------------------------------------------------------------------------
 
 def parse_cg(cg: Optional[str]) -> ParsedCg:
-    """Parse a miniprot ``cg:Z`` string into operation counts.
-
-    Parameters
-    ----------
-    cg : str or None
-        The compact cigar-like string (AA space).
-
-    Returns
-    -------
-    ParsedCg
-        Totals for M, I, D, G and intronic nt.
-    """
+    """Parse a miniprot ``cg:Z`` string into operation counts."""
     if not isinstance(cg, str):
         return ParsedCg()
     M = I = D = G = intron_nt = 0
@@ -131,16 +99,10 @@ def parse_cg(cg: Optional[str]) -> ParsedCg:
 def parse_cs(cs: Optional[str]) -> Tuple[int, int]:
     """Parse a miniprot ``cs:Z`` string to count identity and substitutions.
 
-    Parameters
-    ----------
-    cs : str or None
-        Miniprot cs string in protein mode.
-
     Returns
     -------
     (int, int)
-        Tuple of (identical_aa_count, substitution_count). The second value is
-        not used directly in scoring here, but is made available for future use.
+        (identical_aa_count, substitution_count)
     """
     if not isinstance(cs, str):
         return 0, 0
@@ -150,18 +112,7 @@ def parse_cs(cs: Optional[str]) -> Tuple[int, int]:
 
 
 def read_lines(source: str) -> List[str]:
-    """Read all lines from a file path or stdin.
-
-    Parameters
-    ----------
-    source : str
-        Path to GFF3 file, or ``"-"`` to read from stdin.
-
-    Returns
-    -------
-    list of str
-        Lines of text.
-    """
+    """Read all lines from a file path or stdin."""
     if source == "-" or source is None:
         return sys.stdin.read().splitlines()
     with open(source, "r", encoding="utf-8") as fh:
@@ -169,25 +120,7 @@ def read_lines(source: str) -> List[str]:
 
 
 def read_paf_from_gff_lines(lines: Sequence[str]) -> pd.DataFrame:
-    """Extract PAF-like fields from GFF3 ``##PAF\t...`` header lines.
-
-    Parameters
-    ----------
-    lines : Sequence[str]
-        All lines of a miniprot GFF3 file.
-
-    Returns
-    -------
-    pandas.DataFrame
-        A table with one row per candidate alignment and columns for miniprot
-        tags (``AS``, ``ms``, ``np``, ``fs``, ``st``, ``cg``, ``cs``) plus
-        core PAF fields (query/target coordinates).
-
-    Raises
-    ------
-    SystemExit
-        If no PAF header lines are found.
-    """
+    """Extract PAF-like fields from GFF3 ``##PAF\t...`` header lines."""
     rows: List[Dict[str, object]] = []
     for ln in lines:
         if not ln:
@@ -256,18 +189,7 @@ def read_paf_from_gff_lines(lines: Sequence[str]) -> pd.DataFrame:
 
 
 def read_gff_features(lines: Sequence[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Parse mRNA and CDS features from miniprot GFF3 body lines.
-
-    Parameters
-    ----------
-    lines : Sequence[str]
-        All lines of the input GFF3.
-
-    Returns
-    -------
-    (pandas.DataFrame, pandas.DataFrame)
-        ``mRNA`` rows and ``CDS`` rows, with parsed attributes.
-    """
+    """Parse mRNA and CDS features from miniprot GFF3 body lines."""
     mrows: List[Dict[str, object]] = []
     crows: List[Dict[str, object]] = []
     for ln in lines:
@@ -279,7 +201,7 @@ def read_gff_features(lines: Sequence[str]) -> Tuple[pd.DataFrame, pd.DataFrame]
         seqid, source, ftype, start, end, score, strand, phase, attrs = parts[:9]
         start_i, end_i = int(start), int(end)
 
-        # Attribute parsing (tolerant of missing keys)
+        # Attribute parsing (tolerant)
         ad: Dict[str, str] = {}
         for kv in attrs.strip().split(";"):
             if "=" in kv:
@@ -331,20 +253,7 @@ def read_gff_features(lines: Sequence[str]) -> Tuple[pd.DataFrame, pd.DataFrame]
 # ---------------------------------------------------------------------------
 
 def add_alignment_metrics(df: pd.DataFrame) -> pd.DataFrame:
-    """Append derived alignment metrics to the PAF dataframe.
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        Raw PAF dataframe (from ``##PAF`` headers).
-
-    Returns
-    -------
-    pandas.DataFrame
-        Input dataframe with added columns:
-        ``M,I,D,G,intron_nt,aa_aligned,aa_ident,aa_subs,cov_aa,pid_aa,positives,
-        ms_per_qlen,AS_per_qlen,len_frac,cds_aa_len``.
-    """
+    """Append derived alignment metrics to the PAF dataframe."""
     cg_parsed = df["cg"].apply(parse_cg)
     df[["M", "I", "D", "G", "intron_nt"]] = pd.DataFrame(
         [(p.M, p.I, p.D, p.G, p.intron_nt) for p in cg_parsed], index=df.index
@@ -363,7 +272,6 @@ def add_alignment_metrics(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _linear(row: pd.Series, args: argparse.Namespace, length_metric: str) -> float:
-    """Linear weighted combination of metrics (helpers for score_alignment)."""
     return (
         args.w_pid * float(row["pid_aa"])
         + args.w_cov * float(row["cov_aa"])
@@ -375,7 +283,6 @@ def _linear(row: pd.Series, args: argparse.Namespace, length_metric: str) -> flo
 
 
 def _geom(row: pd.Series, args: argparse.Namespace, length_metric: str, eps: float = 1e-9) -> float:
-    """Geometric product of metrics with weights as exponents (helpers for score_alignment)."""
     factors: List[float] = []
     for w, val in (
         (args.w_pid, float(row["pid_aa"])),
@@ -386,7 +293,6 @@ def _geom(row: pd.Series, args: argparse.Namespace, length_metric: str, eps: flo
         (args.w_len, float(row[length_metric])),
     ):
         if w != 0:
-            # note: value is clamped to epsilon to avoid zeroing out the product
             factors.append(max(val, eps) ** w)
     if not factors:
         return 0.0
@@ -397,23 +303,7 @@ def _geom(row: pd.Series, args: argparse.Namespace, length_metric: str, eps: flo
 
 
 def score_alignment(row: pd.Series, mode: str, args: argparse.Namespace) -> float:
-    """Compute a score for a candidate row.
-
-    Parameters
-    ----------
-    row : pandas.Series
-        A single candidate alignment row (from the PAF dataframe).
-    mode : {"ms_cov_pos","AS","ms","pid_cov","pid_cov_len","length","linear","geom"}
-        Scoring function/mode.
-    args : argparse.Namespace
-        Parsed CLI args containing scoring weights.
-
-    Returns
-    -------
-    float
-        The score value; higher is better.
-    """
-    # choose length metric
+    """Compute a score for a candidate row."""
     length_metric = "len_frac" if args.length_metric == "frac" else "cds_aa_len"
 
     if mode == "ms_cov_pos":
@@ -435,50 +325,18 @@ def score_alignment(row: pd.Series, mode: str, args: argparse.Namespace) -> floa
     if mode == "geom":
         return _geom(row, args, length_metric)
 
-    # default
     return float(row["ms_per_qlen"]) * float(row["cov_aa"]) * (0.5 + 0.5 * float(row["positives"]))
 
 
 def apply_gates(df: pd.DataFrame, cov_min: float = 0.60, pid_min: float = 0.30) -> pd.DataFrame:
-    """Apply gating thresholds for coverage and identity.
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        PAF dataframe with derived metrics.
-    cov_min : float, optional
-        Minimum query coverage, by default 0.60.
-    pid_min : float, optional
-        Minimum identity, by default 0.30.
-
-    Returns
-    -------
-    pandas.DataFrame
-        Copy of dataframe with a boolean column ``passes``.
-    """
+    """Apply gating thresholds for coverage and identity."""
     out = df.copy()
     out["passes"] = (out["cov_aa"] >= cov_min) & (out["pid_aa"] >= pid_min)
     return out
 
 
 def cluster_into_loci(df: pd.DataFrame, pad_nt: int = 5000) -> pd.DataFrame:
-    """Cluster hits into loci along each target sequence and strand.
-
-    A new locus starts if the next hit begins more than ``pad_nt`` nucleotides
-    downstream of the running ``end`` of the current locus.
-
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        PAF dataframe with target coordinates.
-    pad_nt : int, optional
-        Maximum gap (nt) allowed to merge hits into the same locus, by default 5000.
-
-    Returns
-    -------
-    pandas.DataFrame
-        Copy of ``df`` with an added categorical column ``locus``.
-    """
+    """Cluster hits into loci along each target sequence and strand."""
     out = df.copy()
     out["locus"] = None
     for (tname, strand), sub in df.sort_values(["tname", "strand", "tstart", "tend"]).groupby(
@@ -508,25 +366,7 @@ def jaccard(a0: int, a1: int, b0: int, b1: int) -> float:
 
 
 def attach_mrna_and_cds_length(winners: pd.DataFrame, mdf: pd.DataFrame, cdf: pd.DataFrame) -> pd.DataFrame:
-    """Find the matching mRNA in the GFF and compute total CDS span for winners.
-
-    We select the mRNA on the same sequence/strand with the same Target qname
-    that maximizes the genomic overlap with the PAF interval.
-
-    Parameters
-    ----------
-    winners : pandas.DataFrame
-        Chosen winners per locus.
-    mdf : pandas.DataFrame
-        All mRNA features from the GFF.
-    cdf : pandas.DataFrame
-        All CDS features from the GFF.
-
-    Returns
-    -------
-    pandas.DataFrame
-        ``winners`` with two new columns: ``mrna_id`` and ``gff_cds_nt_len``.
-    """
+    """Find the matching mRNA in the GFF and compute total CDS span for winners."""
     mrna_ids: List[Optional[str]] = []
     cds_sums: List[Optional[int]] = []
 
@@ -562,23 +402,21 @@ def gff3_escape(s: str) -> str:
     return s.replace("%", "%25").replace(";", "%3B").replace("=", "%3D").replace(",", "%2C").replace("&", "%26")
 
 
-def write_best_gff3(out_path: str, winners: pd.DataFrame, mdf: pd.DataFrame, cdf: pd.DataFrame, id_prefix: str = "PBM") -> None:
+def _open_out_handle(path: Optional[str], default: TextIO) -> Tuple[TextIO, bool]:
+    """Return a writable handle and whether we own/should close it."""
+    if path is None or path == "-" or path == "":
+        return default, False
+    fh = open(path, "w", encoding="utf-8")
+    return fh, True
+
+
+def write_best_gff3(out_path: Optional[str], winners: pd.DataFrame, mdf: pd.DataFrame, cdf: pd.DataFrame, id_prefix: str = "PBM") -> None:
     """Write the best-per-locus annotations as a valid GFF3 hierarchy.
 
-    Parameters
-    ----------
-    out_path : str
-        Destination GFF3 file path.
-    winners : pandas.DataFrame
-        Selected winners per locus (with mapping to mRNA if available).
-    mdf : pandas.DataFrame
-        mRNA features extracted from input GFF.
-    cdf : pandas.DataFrame
-        CDS features extracted from input GFF.
-    id_prefix : str, optional
-        Prefix for synthesized gene/mRNA/CDS IDs when needed, by default "PBM".
+    If ``out_path`` is None/'-' -> write to stdout.
     """
-    with open(out_path, "w", encoding="utf-8") as out:
+    out, close_me = _open_out_handle(out_path, sys.stdout)
+    try:
         out.write("##gff-version 3\n")
         for _, r in winners.iterrows():
             if pd.isna(r.get("mrna_id")):
@@ -623,6 +461,9 @@ def write_best_gff3(out_path: str, winners: pd.DataFrame, mdf: pd.DataFrame, cdf
                 cstart, cend = int(c["start"]), int(c["end"])
                 phase = str(c["phase"]) if str(c["phase"]) in ("0", "1", "2") else "0"
                 out.write(f"{seqid}\tminiprot\tCDS\t{cstart}\t{cend}\t.\t{strand}\t{phase}\tID={cds_id};Parent={mrna_id}\n")
+    finally:
+        if close_me:
+            out.close()
 
 
 # ---------------------------------------------------------------------------
@@ -630,27 +471,16 @@ def write_best_gff3(out_path: str, winners: pd.DataFrame, mdf: pd.DataFrame, cdf
 # ---------------------------------------------------------------------------
 
 def configure_logging(level: str = "INFO") -> None:
-    """Configure root logger with a standard format.
-
-    Parameters
-    ----------
-    level : str, optional
-        Logging level name, by default "INFO".
-    """
+    """Configure root logger with a standard format (logs to stderr)."""
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)s] %(message)s",
+        stream=sys.stderr,
     )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """Build the command-line interface parser.
-
-    Returns
-    -------
-    argparse.ArgumentParser
-        Configured argument parser.
-    """
+    """Build the command-line interface parser."""
     ap = argparse.ArgumentParser(
         description=(
             "Pick best miniprot alignments per locus from a GFF3 (with ##PAF headers). "
@@ -710,19 +540,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Output / misc
     ap.add_argument("--id-prefix", default="PBM", help="Prefix for synthesized Gene/CDS IDs (default: PBM)")
-    ap.add_argument("--out-gff3", default="best_per_locus.gff3", help="Output GFF3 path (default: best_per_locus.gff3)")
-    ap.add_argument("--out-tsv", default="best_per_locus.tsv", help="Output TSV summary path (default: best_per_locus.tsv)")
+    ap.add_argument(
+        "--out-gff3",
+        default="-",
+        help="Output GFF3 path (default: '-' = stdout)",
+    )
+    ap.add_argument(
+        "--out-tsv",
+        default=None,
+        help="Output TSV path (default: write TSV to stderr). Use '-' to also force stderr.",
+    )
     ap.add_argument("--log-level", default="INFO", help="Logging level (DEBUG, INFO, WARNING, ERROR; default: INFO)")
     return ap
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI entrypoint.
-
-    Parameters
-    ----------
-    argv : Sequence[str] or None, optional
-        Command-line arguments (for testing). If ``None``, uses ``sys.argv[1:]``.
 
     Returns
     -------
@@ -810,9 +643,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Selection policy
         def choose(df: pd.DataFrame) -> pd.Series:
             if args.selection_mode in ("longest", "longest_prefer_intact"):
-                # passing first, then longest aa, then score
                 return df.sort_values(["passes", "cds_aa_len", "score_raw"], ascending=[False, False, False]).iloc[0]
-            # default: best score (already sorted)
             return df.iloc[0]
 
         working = sub
@@ -850,7 +681,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Map back to GFF features for chosen winners
     winners = attach_mrna_and_cds_length(winners, mdf, cdf)
 
-    # Write TSV
+    # Write TSV (file if given; else stderr)
     tsv_cols = [
         "locus",
         "tname",
@@ -874,12 +705,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "mrna_id",
         "gff_cds_nt_len",
     ]
-    winners[tsv_cols].to_csv(args.out_tsv, sep="\t", index=False)
-    logging.info("Wrote TSV summary: %s", args.out_tsv)
 
-    # Write GFF3
+    if args.out_tsv and args.out_tsv != "-":
+        winners[tsv_cols].to_csv(args.out_tsv, sep="\t", index=False)
+        logging.info("Wrote TSV summary: %s", args.out_tsv)
+    else:
+        # Pure TSV to stderr (logs may interleave; consider --log-level ERROR or redirect)
+        winners[tsv_cols].to_csv(sys.stderr, sep="\t", index=False)
+        logging.info("Wrote TSV summary to stderr")
+
+    # Write GFF3 (stdout by default)
     write_best_gff3(args.out_gff3, winners, mdf, cdf, id_prefix=args.id_prefix)
-    logging.info("Wrote best-per-locus GFF3: %s", args.out_gff3)
+    if args.out_gff3 and args.out_gff3 != "-":
+        logging.info("Wrote best-per-locus GFF3: %s", args.out_gff3)
+    else:
+        logging.info("Wrote best-per-locus GFF3 to stdout")
 
     return 0
 
@@ -898,4 +738,3 @@ if __name__ == "__main__":
         except Exception:
             pass
         raise
-```
