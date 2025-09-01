@@ -24,16 +24,16 @@ Key behaviors
 Examples
 --------
     # Extract proteins from a maxiprot GFF3 and write FASTA to stdout
-    ./maxiprot ... | ./maxiprot_extract_proteins.py -g genome.fa > proteins.faa
+    maxiprot filter ... | maxiprot extract -g genome.fa > proteins.faa
 
     # Extract CDS nucleotides instead of proteins
-    ./maxiprot_extract_proteins.py annotations.gff3 -g genome.fa --extract cds > cds.fna
+    maxiprot extract annotations.gff3 -g genome.fa --extract cds > cds.fna
 
     # Extract gene genomic sequences (strand-corrected)
-    ./maxiprot_extract_proteins.py annotations.gff3 -g genome.fa --extract gene > genes.fna
+    maxiprot extract annotations.gff3 -g genome.fa --extract gene > genes.fna
 
     # Exclude pseudogenes (protein mode only) and use bacterial translation table (11)
-    ./maxiprot_extract_proteins.py annotations.gff3 -g genome.fa \
+    maxiprot extract annotations.gff3 -g genome.fa \
         --exclude-pseudogenes --transl-table 11 > proteins.faa
 """
 
@@ -54,7 +54,9 @@ from maxiprot._version import __version__
 
 
 def _codon_table_standard() -> Dict[str, str]:
-    """NCBI translation table 1 (Standard Genetic Code)."""
+    """
+    NCBI translation table 1 (Standard Genetic Code).
+    """
     # fmt: off
     table = {
         "TTT":"F","TTC":"F","TTA":"L","TTG":"L",
@@ -79,19 +81,25 @@ def _codon_table_standard() -> Dict[str, str]:
 
 
 def _codon_table_bacterial() -> Dict[str, str]:
-    """NCBI translation table 11 (Bacterial, Archaeal and Plant Plastid)."""
+    """
+    NCBI translation table 11 (Bacterial, Archaeal and Plant Plastid).
+    """
     return _codon_table_standard()
 
 
 def _codon_table_mold_protozoan_mito() -> Dict[str, str]:
-    """NCBI translation table 4 (Mold, Protozoan, etc. Mitochondrial Code)."""
+    """
+    NCBI translation table 4 (Mold, Protozoan, etc. Mitochondrial Code).
+    """
     tbl = _codon_table_standard().copy()
     tbl['TGA'] = 'W'
     return tbl
 
 
 def _codon_table_vert_mito() -> Dict[str, str]:
-    """NCBI translation table 2 (Vertebrate Mitochondrial Code)."""
+    """
+    NCBI translation table 2 (Vertebrate Mitochondrial Code).
+    """
     tbl = _codon_table_standard().copy()
     tbl['AGA'] = '*'
     tbl['AGG'] = '*'
@@ -100,7 +108,8 @@ def _codon_table_vert_mito() -> Dict[str, str]:
 
 
 def get_codon_table(table_id: int) -> Dict[str, str]:
-    """Return a codon→AA map for the requested NCBI translation table.
+    """
+    Return a codon→AA map for the requested NCBI translation table.
 
     Parameters
     ----------
@@ -131,7 +140,8 @@ def get_codon_table(table_id: int) -> Dict[str, str]:
 
 
 def translate_nt(seq_nt: str, table_id: int) -> str:
-    """Translate nucleotide sequence into amino acids.
+    """
+    Translate nucleotide sequence into amino acids.
 
     Any codon containing non-ACGT letters yields 'X'.
     Trailing bases that don't complete a codon are ignored.
@@ -165,7 +175,9 @@ def translate_nt(seq_nt: str, table_id: int) -> str:
 
 @dataclass
 class CdsPart:
-    """A single CDS feature line."""
+    """
+    A single CDS feature line.
+    """
 
     seqid: str
     start: int  # 1-based inclusive
@@ -177,7 +189,9 @@ class CdsPart:
 
 @dataclass
 class Mrna:
-    """An mRNA with its CDS parts."""
+    """
+    An mRNA with its CDS parts.
+    """
 
     mrna_id: str
     seqid: str
@@ -191,7 +205,9 @@ class Mrna:
 
 @dataclass
 class Gene:
-    """A gene feature with genomic span."""
+    """
+    A gene feature with genomic span.
+    """
 
     gene_id: str
     seqid: str
@@ -205,7 +221,8 @@ class Gene:
 def parse_gff(
     gff_lines: Iterable[str],
 ) -> Tuple[Dict[str, Mrna], Dict[str, int], Dict[str, Gene], Dict[str, int]]:
-    """Parse gene, mRNA, and CDS features from a GFF3 stream.
+    """
+    Parse gene, mRNA, and CDS features from a GFF3 stream.
 
     Parameters
     ----------
@@ -316,19 +333,24 @@ def parse_gff(
 
 
 def reverse_complement(seq: str) -> str:
-    """Return reverse complement for A/C/G/T/N sequences (others -> N)."""
+    """
+    Return reverse complement for A/C/G/T/N sequences (others -> N).
+    """
     comp = str.maketrans('ACGTNacgtn', 'TGCANtgcan')
     seq_rc = seq.translate(comp)
     return ''.join(ch if ch in 'ACGTNacgtn' else 'N' for ch in seq_rc[::-1])
 
 
 def fetch_interval(fa: Fasta, seqid: str, start_1based: int, end_1based: int) -> str:
-    """Fetch genomic interval in FASTA (1-based inclusive coordinates)."""
+    """
+    Fetch genomic interval in FASTA (1-based inclusive coordinates).
+    """
     return str(fa[seqid][start_1based - 1 : end_1based]).upper()
 
 
 def fetch_cds_sequence(fa: Fasta, cds_parts: List[CdsPart], strand: str) -> str:
-    """Fetch and concatenate CDS nucleotide in transcript orientation.
+    """
+    Fetch and concatenate CDS nucleotide in transcript orientation.
 
     This implementation applies the GFF3 `phase` **only to the first CDS part**
     in transcript order (5'→3' of the mRNA). Subsequent CDS parts are *not*
@@ -398,7 +420,9 @@ def fetch_cds_sequence(fa: Fasta, cds_parts: List[CdsPart], strand: str) -> str:
 
 
 def count_non_acgt(seq: str) -> int:
-    """Count non-ACGT letters (after uppercasing and U->T)."""
+    """
+    Count non-ACGT letters (after uppercasing and U->T).
+    """
     seq = seq.upper().replace('U', 'T')
     return sum(1 for ch in seq if ch not in {'A', 'C', 'G', 'T'})
 
@@ -409,7 +433,8 @@ def count_non_acgt(seq: str) -> int:
 def write_fasta(
     records: Iterable[Tuple[str, str]], handle: TextIO, width: int = 60
 ) -> None:
-    """Write FASTA records to a text handle.
+    """
+    Write FASTA records to a text handle.
 
     Parameters
     ----------
@@ -430,7 +455,9 @@ def write_fasta(
 
 
 def configure_logging(level: str = 'INFO') -> None:
-    """Configure root logger to stderr with a concise format."""
+    """
+    Configure root logger to stderr with a concise format.
+    """
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format='%(asctime)s [%(levelname)s] %(message)s',
@@ -439,7 +466,9 @@ def configure_logging(level: str = 'INFO') -> None:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """Build CLI parser."""
+    """
+    Build CLI parser.
+    """
     ap = argparse.ArgumentParser(
         description=f'Extract sequences from maxiprot GFF3 (v{__version__})'
     )
@@ -492,7 +521,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def open_gff_lines(path: str) -> Iterable[str]:
-    """Yield lines from a GFF path or stdin."""
+    """
+    Yield lines from a GFF path or stdin.
+    """
     if path == '-' or path is None:
         for ln in sys.stdin:
             yield ln
@@ -503,14 +534,18 @@ def open_gff_lines(path: str) -> Iterable[str]:
 
 
 def _open_out_handle(path: str) -> Tuple[TextIO, bool]:
-    """Open output handle (stdout if '-' or empty)."""
+    """
+    Open output handle (stdout if '-' or empty).
+    """
     if path in (None, '', '-'):
         return sys.stdout, False
     return open(path, 'w', encoding='utf-8'), True
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """Entrypoint."""
+    """
+    Entrypoint.
+    """
     ap = build_arg_parser()
     args = ap.parse_args(argv)
 
