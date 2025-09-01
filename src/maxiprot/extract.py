@@ -330,10 +330,14 @@ def fetch_interval(fa: Fasta, seqid: str, start_1based: int, end_1based: int) ->
 def fetch_cds_sequence(fa: Fasta, cds_parts: List[CdsPart], strand: str) -> str:
     """Fetch and concatenate CDS nucleotide in transcript orientation.
 
-    GFF3 uses 1-based inclusive; pyfaidx uses 0-based end-exclusive.
-    Phase handling:
-      - For '+' strand: remove `phase` from the LEFT of each part.
-      - For '-' strand: reverse-complement each piece first, then remove its `phase` from the LEFT.
+    This implementation applies the GFF3 `phase` **only to the first CDS part**
+    in transcript order (5'→3' of the mRNA). Subsequent CDS parts are *not*
+    trimmed, regardless of their individual `phase` values.
+
+    Transcript order:
+      - '+' strand: CDS parts sorted by ascending genomic start.
+      - '-' strand: CDS parts sorted by descending genomic start; each piece is
+        reverse-complemented to maintain 5'→3' transcript orientation.
 
     Parameters
     ----------
@@ -352,25 +356,44 @@ def fetch_cds_sequence(fa: Fasta, cds_parts: List[CdsPart], strand: str) -> str:
     if strand not in {'+', '-'}:
         raise ValueError(f'Invalid strand: {strand}')
 
+    # Sort parts into transcript order (5'->3' on the mRNA)
     parts = sorted(cds_parts, key=lambda p: p.start, reverse=(strand == '-'))
+
     chunks: List[str] = []
-    for part in parts:
+    for idx, part in enumerate(parts):
         s = fetch_interval(fa, part.seqid, part.start, part.end)
         if strand == '-':
             s = reverse_complement(s)
-        if part.phase in (1, 2):
-            if len(s) >= part.phase:
-                s = s[part.phase :]
-            else:
-                logging.warning(
-                    'CDS part shorter than phase (seqid=%s start=%d end=%d phase=%d)',
+
+        if idx == 0:
+            # Apply phase ONLY to the first exon in transcript order.
+            if part.phase in (1, 2):
+                if len(s) >= part.phase:
+                    s = s[part.phase :]
+                else:
+                    logging.warning(
+                        'First CDS part shorter than its phase; trimming to empty '
+                        '(seqid=%s start=%d end=%d phase=%d)',
+                        part.seqid,
+                        part.start,
+                        part.end,
+                        part.phase,
+                    )
+                    s = ''
+        else:
+            # Subsequent exons must NOT be trimmed by their phase.
+            if part.phase not in (0, None):
+                logging.debug(
+                    'Non-zero phase (%d) on non-first CDS part is being ignored '
+                    '(seqid=%s start=%d end=%d).',
+                    part.phase,
                     part.seqid,
                     part.start,
                     part.end,
-                    part.phase,
                 )
-                s = ''
+
         chunks.append(s)
+
     return ''.join(chunks)
 
 
