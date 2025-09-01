@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Pick the best miniprot alignment per locus from a miniprot GFF3.
+"""
+Pick the best miniprot alignment per locus from a miniprot GFF3.
 
 Default outputs:
 - GFF3 → **stdout** (unless --out-gff3 PATH is provided)
@@ -57,7 +58,8 @@ _RE_CS_SUBS = re.compile(
 
 @dataclass(frozen=True)
 class ParsedCg:
-    """Parsed components of miniprot PAF ``cg:Z`` string.
+    """
+    Parsed components of miniprot PAF ``cg:Z`` string.
 
     Parameters
     ----------
@@ -81,7 +83,8 @@ class ParsedCg:
 
 
 def parse_cg(cg: Optional[str]) -> ParsedCg:
-    """Parse a miniprot ``cg:Z`` string into operation counts."""
+    """
+    Parse a miniprot ``cg:Z`` string into operation counts."""
     if not isinstance(cg, str):
         return ParsedCg()
     M = I = D = G = intron_nt = 0
@@ -101,7 +104,8 @@ def parse_cg(cg: Optional[str]) -> ParsedCg:
 
 
 def parse_cs(cs: Optional[str]) -> Tuple[int, int]:
-    """Parse a miniprot ``cs:Z`` string to count identity and substitutions.
+    """
+    Parse a miniprot ``cs:Z`` string to count identity and substitutions.
 
     Returns
     -------
@@ -116,7 +120,8 @@ def parse_cs(cs: Optional[str]) -> Tuple[int, int]:
 
 
 def read_lines(source: str) -> List[str]:
-    """Read all lines from a file path or stdin."""
+    """
+    Read all lines from a file path or stdin."""
     if source == '-' or source is None:
         return sys.stdin.read().splitlines()
     with open(source, 'r', encoding='utf-8') as fh:
@@ -124,7 +129,8 @@ def read_lines(source: str) -> List[str]:
 
 
 def read_paf_from_gff_lines(lines: Sequence[str]) -> pd.DataFrame:
-    """Extract PAF-like fields from GFF3 ``##PAF\t...`` header lines."""
+    """
+    Extract PAF-like fields from GFF3 ``##PAF\t...`` header lines."""
     rows: List[Dict[str, object]] = []
 
     def to_int(k: str) -> int:
@@ -194,7 +200,9 @@ def read_paf_from_gff_lines(lines: Sequence[str]) -> pd.DataFrame:
 
 
 def read_gff_features(lines: Sequence[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Parse mRNA and CDS features from miniprot GFF3 body lines."""
+    """
+    Parse mRNA and CDS features from miniprot GFF3 body lines.
+    """
     mrows: List[Dict[str, object]] = []
     crows: List[Dict[str, object]] = []
     for ln in lines:
@@ -259,7 +267,9 @@ def read_gff_features(lines: Sequence[str]) -> Tuple[pd.DataFrame, pd.DataFrame]
 
 
 def add_alignment_metrics(df: pd.DataFrame) -> pd.DataFrame:
-    """Append derived alignment metrics to the PAF dataframe."""
+    """
+    Append derived alignment metrics to the PAF dataframe.
+    """
     cg_parsed = df['cg'].apply(parse_cg)
     df[['M', 'I', 'D', 'G', 'intron_nt']] = pd.DataFrame(
         [(p.M, p.I, p.D, p.G, p.intron_nt) for p in cg_parsed], index=df.index
@@ -311,7 +321,9 @@ def _geom(
 
 
 def score_alignment(row: pd.Series, mode: str, args: argparse.Namespace) -> float:
-    """Compute a score for a candidate row."""
+    """
+    Compute a score for a candidate row.
+    """
     length_metric = 'len_frac' if args.length_metric == 'frac' else 'cds_aa_len'
 
     if mode == 'ms_cov_pos':
@@ -380,7 +392,9 @@ def cluster_into_loci(df: pd.DataFrame, pad_nt: int = 5000) -> pd.DataFrame:
 
 
 def jaccard(a0: int, a1: int, b0: int, b1: int) -> float:
-    """Compute Jaccard index for two closed intervals [a0,a1], [b0,b1]."""
+    """
+    Compute Jaccard index for two closed intervals [a0,a1], [b0,b1].
+    """
     inter = max(0, min(a1, b1) - max(a0, b0) + 1)
     uni = (a1 - a0 + 1) + (b1 - b0 + 1) - inter
     return inter / uni if uni > 0 else 0.0
@@ -389,7 +403,9 @@ def jaccard(a0: int, a1: int, b0: int, b1: int) -> float:
 def attach_mrna_and_cds_length(
     winners: pd.DataFrame, mdf: pd.DataFrame, cdf: pd.DataFrame
 ) -> pd.DataFrame:
-    """Find the matching mRNA in the GFF and compute total CDS span for winners."""
+    """
+    Find the matching mRNA in the GFF and compute total CDS span for winners.
+    """
     mrna_ids: List[Optional[str]] = []
     cds_sums: List[Optional[int]] = []
 
@@ -435,7 +451,9 @@ def attach_mrna_and_cds_length(
 
 
 def gff3_escape(s: str) -> str:
-    """Escape attribute values for GFF3 (percent-first order)."""
+    """
+    Escape attribute values for GFF3 (percent-first order).
+    """
     return (
         s.replace('%', '%25')
         .replace(';', '%3B')
@@ -446,7 +464,9 @@ def gff3_escape(s: str) -> str:
 
 
 def _open_out_handle(path: Optional[str], default: TextIO) -> Tuple[TextIO, bool]:
-    """Return a writable handle and whether we own/should close it."""
+    """
+    Return a writable handle and whether we own/should close it.
+    """
     if path is None or path == '-' or path == '':
         return default, False
     fh = open(path, 'w', encoding='utf-8')
@@ -460,7 +480,8 @@ def write_best_gff3(
     cdf: pd.DataFrame,
     id_prefix: str = 'PBM',
 ) -> None:
-    """Write the best-per-locus annotations as a valid GFF3 hierarchy.
+    """
+    Write the best-per-locus annotations as a valid GFF3 hierarchy.
 
     If ``out_path`` is None/'-' -> write to stdout.
     """
@@ -533,7 +554,9 @@ def write_best_gff3(
 
 
 def configure_logging(level: str = 'INFO') -> None:
-    """Configure root logger with a standard format (logs to stderr)."""
+    """
+    Configure root logger with a standard format (logs to stderr).
+    """
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format='%(asctime)s [%(levelname)s] %(message)s',
@@ -542,7 +565,9 @@ def configure_logging(level: str = 'INFO') -> None:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """Build the command-line interface parser."""
+    """
+    Build the command-line interface parser.
+    """
     ap = argparse.ArgumentParser(
         description=(
             'Pick best miniprot alignments per locus from a GFF3 (with ##PAF headers). '
@@ -685,7 +710,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """CLI entrypoint.
+    """
+    CLI entrypoint.
 
     Returns
     -------
