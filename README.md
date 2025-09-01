@@ -50,6 +50,7 @@ Write gff on **stdout**:
 ```bash
 maxiprot filter miniprot.gff3 1> best_per_locus.gff3
 ```
+
 ---
 
 ## Installation
@@ -78,7 +79,6 @@ python -m pip install git+https://github.com/Adamtaranto/maxiprot.git
 ```bash
 git clone https://github.com/Adamtaranto/maxiprot.git && cd maxiprot && pip install -e '.[dev]'
 ```
-
 
 ---
 
