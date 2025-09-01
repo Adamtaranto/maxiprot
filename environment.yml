@@ -1,0 +1,14 @@
+name: maxiprot
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - miniprot
+  - pip
+  - python=3.12
+  - samtools
+  - pip:
+      - pandas
+      - pyfaidx
+      - biopython
+      - git+https://github.com/Adamtaranto/maxiprot.git
