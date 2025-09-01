@@ -819,8 +819,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         winners_rows.append(pick)
 
     if not winners_rows:
-        logging.error('No winners selected. Exiting.')
-        return 2
+        logging.warning('No winners selected. Exiting.')
+        return 0
 
     winners = pd.DataFrame(winners_rows)
     winners = winners.assign(
