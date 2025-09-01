@@ -25,7 +25,11 @@ jobs:
       - name: Set up Miniconda
         uses: conda-incubator/setup-miniconda@v3
         with:
+          auto-activate: true
           auto-update-conda: true  # Optional: update Conda to the latest version
+          channels: conda-forge,bioconda
+          conda-remove-defaults: true
+          environment-file: false
           python-version: ${{ matrix.python-version }}
 
       # Install any additional dependencies not included in the pyproject.toml file
