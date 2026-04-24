@@ -23,7 +23,7 @@ jobs:
 
       # Set up Miniconda
       - name: Set up Miniconda
-        uses: conda-incubator/setup-miniconda@v3
+        uses: conda-incubator/setup-miniconda@v4
         with:
           auto-activate: true
           auto-update-conda: true  # Optional: update Conda to the latest version
