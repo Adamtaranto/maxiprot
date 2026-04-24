@@ -851,9 +851,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     winners = pd.DataFrame(winners_rows)
     winners = winners.assign(
         status=winners.apply(
-            lambda r: 'pseudogene'
-            if (int(r['fs']) > 0 or int(r['st']) > 0)
-            else 'intact',
+            lambda r: (
+                'pseudogene' if (int(r['fs']) > 0 or int(r['st']) > 0) else 'intact'
+            ),
             axis=1,
         )
     )
