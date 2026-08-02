@@ -39,31 +39,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
+from maxiprot.logs import init_logging
+
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
-
-
-def configure_logging(level: str = 'INFO') -> None:
-    """
-    Configure the root logger.
-
-    Parameters
-    ----------
-    level : str, default 'INFO'
-        Logging level name ('DEBUG', 'INFO', 'WARNING', 'ERROR').
-
-    Notes
-    -----
-    Logs are written to **stderr** so that TSV output can be emitted to
-    stderr without being mixed with log lines when desired.
-    """
-    lvl = getattr(logging, level.upper(), logging.INFO)
-    logging.basicConfig(
-        level=lvl,
-        format='[%(levelname)s] %(message)s',
-        stream=sys.stderr,
-    )
 
 
 def gff3_escape(x: str) -> str:
@@ -358,6 +338,151 @@ def gate_intact_v_pseudo(df: pd.DataFrame) -> pd.Series:
     return (fs == 0) & (st == 0)
 
 
+def _parse_target_name(s: Optional[str]) -> Optional[str]:
+    """Return the first token of a GFF3 Target attribute."""
+    if not s:
+        return None
+    s = str(s).strip()
+    if not s:
+        return None
+    return s.split()[0]
+
+
+def _interval_overlap(a1: int, a2: int, b1: int, b2: int) -> int:
+    """1-based inclusive intervals; return overlap length (>=0)."""
+    return max(0, min(a2, b2) - max(a1, b1) + 1)
+
+
+def attach_mrna_ids_to_winners(
+    winners: pd.DataFrame,
+    mdf: pd.DataFrame,
+    cdf: pd.DataFrame,
+    overlap_thresh: float = 0.5,
+) -> pd.DataFrame:
+    """
+    Attach mrna_id to winners by Target name and/or coordinate overlap.
+
+    Strategy:
+      1) Exact Target name == PAF qname on same seqid/strand (prefer).
+      2) Otherwise, pick mRNA with max overlap with the PAF [tstart+1, tend] on same seqid/strand,
+         accepting if overlap / min(len(paf), len(mrna_span)) >= overlap_thresh.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Winners with 'mrna_id' column filled where matched.
+    """
+    winners = winners.copy()
+
+    # Normalize PAF intervals to 1-based inclusive for matching.
+    winners['paf_start'] = winners['ts'].astype(int) + 1
+    winners['paf_end'] = winners['te'].astype(int)
+    winners['paf_len'] = (winners['paf_end'] - winners['paf_start'] + 1).clip(lower=0)
+
+    # Prepare mRNA table with a reliable ID + span (prefer union of CDS parts).
+    mdf2 = mdf.copy()
+    id_col = 'id' if 'id' in mdf2.columns else 'ID'  # your parser uses 'id'
+    tgt_col = (
+        'target'
+        if 'target' in mdf2.columns
+        else ('Target' if 'Target' in mdf2.columns else None)
+    )
+
+    # Compute union span of CDS per mRNA (safer than mRNA bounds when present)
+    if not cdf.empty and 'parent' in cdf.columns:
+        cds_span = (
+            cdf.groupby('parent', as_index=False)
+            .agg(start_min=('start', 'min'), end_max=('end', 'max'))
+            .rename(columns={'parent': id_col})
+        )
+        mdf2 = mdf2.merge(cds_span, on=id_col, how='left')
+        # choose CDS union if available, else mRNA start/end
+        mdf2['mrna_span_start'] = np.where(
+            mdf2['start_min'].notna(), mdf2['start_min'], mdf2['start']
+        )
+        mdf2['mrna_span_end'] = np.where(
+            mdf2['end_max'].notna(), mdf2['end_max'], mdf2['end']
+        )
+        mdf2.drop(columns=['start_min', 'end_max'], inplace=True)
+    else:
+        mdf2['mrna_span_start'] = mdf2['start']
+        mdf2['mrna_span_end'] = mdf2['end']
+
+    # Parse Target name (first token)
+    if tgt_col:
+        mdf2['target_name'] = mdf2[tgt_col].apply(_parse_target_name)
+    else:
+        mdf2['target_name'] = None
+
+    # Build fast lookups by (seqid,strand)
+    by_chr_strand = {}
+    for _, row in mdf2.iterrows():
+        key = (row['seqid'], row['strand'])
+        by_chr_strand.setdefault(key, []).append(row)
+
+    # For each winner, try to assign mrna_id
+    mrna_ids: list[Optional[str]] = []
+    for _, w in winners.iterrows():
+        key = (w['tname'], w['strand'])
+        candidates = by_chr_strand.get(key, [])
+        if not candidates:
+            mrna_ids.append(None)
+            continue
+
+        # 1) target name match on same seqid/strand
+        qname = str(w.get('qname', '')).strip() or None
+        if qname:
+            name_matches = [r for r in candidates if r.get('target_name') == qname]
+        else:
+            name_matches = []
+
+        chosen: Optional[pd.Series] = None
+        if name_matches:
+            # If multiple, choose by largest overlap of span with PAF interval
+            best = (-1, None)
+            for r in name_matches:
+                ov = _interval_overlap(
+                    int(w['paf_start']),
+                    int(w['paf_end']),
+                    int(r['mrna_span_start']),
+                    int(r['mrna_span_end']),
+                )
+                if ov > best[0]:
+                    best = (ov, r)
+            chosen = best[1]
+
+        # 2) Fallback: coordinate overlap max (if above threshold)
+        if chosen is None:
+            best = (0.0, -1, None)  # (score, ov_len, row)
+            for r in candidates:
+                ov = _interval_overlap(
+                    int(w['paf_start']),
+                    int(w['paf_end']),
+                    int(r['mrna_span_start']),
+                    int(r['mrna_span_end']),
+                )
+                if ov <= 0:
+                    continue
+                paf_len = int(w['paf_len'])
+                mrna_len = int(r['mrna_span_end']) - int(r['mrna_span_start']) + 1
+                denom = max(1, min(paf_len, mrna_len))
+                frac = ov / denom
+                score = (frac, ov)
+                if score > best[:2]:
+                    best = (frac, ov, r)
+            if best[2] is not None and best[0] >= overlap_thresh:
+                chosen = best[2]
+
+        mrna_ids.append(str(chosen[id_col]) if chosen is not None else None)
+
+    winners['mrna_id'] = mrna_ids
+    n_matched = sum(x is not None for x in mrna_ids)
+    logging.info(
+        'Linked %d/%d winners to existing mRNA features.', n_matched, len(winners)
+    )
+    return winners
+
+
 # ---------------------------------------------------------------------------
 # Locus clustering
 # ---------------------------------------------------------------------------
@@ -469,6 +594,12 @@ def write_best_gff3(
     id_prefix : str, default "PBM"
         Prefix used when synthesizing IDs.
     """
+
+    if out_path and out_path != '-':
+        logging.info('Writing filtered records to GFF3: %s', out_path)
+    else:
+        logging.info('Writing filtered records to stdout')
+
     out, close_me = _open_out_handle(out_path)
     try:
         out.write('##gff-version 3\n')
@@ -581,6 +712,9 @@ def write_best_gff3(
                 continue
 
             # Otherwise synthesize a minimal hierarchy from PAF
+            logging.warning(
+                f'No mrna_id found for {r["tname"]}, reconstructing range from PAF. CDS may be incorrect.'
+            )
             seqid = r['tname']
             strand = r['strand']
             # mRNA bounds from ts/te
@@ -783,8 +917,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     int
         Exit status code (0 on success).
     """
+    # Parse args
     args = build_arg_parser().parse_args(argv)
-    configure_logging(args.log_level)
+
+    # Set up logging
+    init_logging(loglevel=args.log_level)
 
     # Read input
     if args.gff in (None, '-', ''):
@@ -969,8 +1106,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         mdf_idx['mrna_id'] = mdf_idx['ID']
         # Join winners to mRNA by (Target contains qname) OR by coords overlap on same seqid/strand
         # Best-effort: users with robust miniprot GFF should get this mapping correct.
-        # For now we carry through winners as-is and write synthesized if not found.
-        winners['mrna_id'] = winners.get('mrna_id', pd.Series([np.nan] * len(winners)))
+        winners = attach_mrna_ids_to_winners(winners, mdf, cdf)
 
     # Write GFF3 (stdout by default)
     write_best_gff3(args.out_gff3, winners, mdf, cdf, id_prefix=args.id_prefix)
@@ -1000,15 +1136,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     tsv_text = tsv_df.to_csv(sep='\t', index=False)
 
-    if args.out_tsv:
+    if args.out_tsv and args.out_tsv != '-':
         with open(args.out_tsv, 'w', encoding='utf-8') as fh:
             fh.write(tsv_text)
+        logging.info('Wrote TSV summary to file: %s', args.out_tsv)
     else:
-        # to stderr
+        # Pure TSV to stderr (logs may interleave; consider --log-level ERROR or redirect)
+        logging.info('Writing TSV summary to stderr:')
         sys.stderr.write(tsv_text)
 
     return 0
 
 
 if __name__ == '__main__':
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:
+        # allow piping into head/tail without noisy tracebacks
+        try:
+            sys.stderr.close()
+        except Exception:
+            pass
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        raise
