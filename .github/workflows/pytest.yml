@@ -16,14 +16,14 @@ jobs:
 
     steps:
       # Checkout the latest commit associated with the PR
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Debug matrix value
         run: echo "Python version is ${{ matrix.python-version }}"
 
       # Set up Miniconda
       - name: Set up Miniconda
-        uses: conda-incubator/setup-miniconda@v3
+        uses: conda-incubator/setup-miniconda@v4
         with:
           auto-activate: true
           auto-update-conda: true  # Optional: update Conda to the latest version
@@ -35,8 +35,8 @@ jobs:
       - name: Install additional dependencies
         run: |
           conda install -y -c conda-forge -c bioconda miniprot
-          python -m pip install --upgrade pip
-          pip install '.[dev]'  # Install all dependencies, including test-specific ones
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install --retries 10 --timeout 180 --prefer-binary --progress-bar off --no-cache-dir '.[test]'
         shell: bash -l {0}
 
       # Run pytest on the specified directory
