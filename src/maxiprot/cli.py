@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 maxiprot CLI entrypoint.
 
 Subcommands
 -----------
-- maxiprot filter   -> run the alignment filtering/selection tool (maxiprot.filter)
-- maxiprot extract  -> run the sequence extraction tool (maxiprot.extract)
-
-All arguments after the subcommand are forwarded unchanged to the corresponding
-module's `main(argv)` function.
+- maxiprot filter   -> select the best miniprot alignment per locus (maxiprot.filter)
+- maxiprot extract  -> extract protein/CDS/gene sequences (maxiprot.extract)
 
 Examples
 --------
@@ -27,48 +23,22 @@ import argparse
 import sys
 from typing import Optional, Sequence
 
-from maxiprot._version import __version__
-
-
-def _load_filter_main():
-    """
-    Import and return maxiprot.filter.main.
-    """
-    try:
-        from maxiprot.filter import main as filter_main  # type: ignore
-    except Exception as e:  # broad to show helpful message
-        raise ModuleNotFoundError(
-            "Failed to import 'maxiprot.filter'. Ensure 'src/maxiprot/filter.py' "
-            'is on the Python path and exposes a callable main(argv) -> int.'
-        ) from e
-    if not callable(filter_main):
-        raise TypeError('maxiprot.filter.main is not callable')
-    return filter_main
-
-
-def _load_extract_main():
-    """
-    Import and return maxiprot.extract.main.
-    """
-    try:
-        from maxiprot.extract import main as extract_main  # type: ignore
-    except Exception as e:
-        raise ModuleNotFoundError(
-            "Failed to import 'maxiprot.extract'. Ensure 'src/maxiprot/extract.py' "
-            'is on the Python path and exposes a callable main(argv) -> int.'
-        ) from e
-    if not callable(extract_main):
-        raise TypeError('maxiprot.extract.main is not callable')
-    return extract_main
+from maxiprot import __version__, extract, filter
+from maxiprot.ioutils import guard_broken_pipe
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the top-level CLI parser that selects a subcommand."""
+    """
+    Build the top-level CLI parser with real subcommand parsers.
+
+    Returns
+    -------
+    argparse.ArgumentParser
+        Parser whose subcommands dispatch via ``args.func(args)``.
+    """
     parser = argparse.ArgumentParser(
         prog='maxiprot',
         description='Unified CLI for maxiprot tools.',
-        epilog="Use 'maxiprot filter --help' or 'maxiprot extract --help' for subcommand options.",
-        add_help=True,
     )
     parser.add_argument(
         '--version', action='version', version=f'maxiprot {__version__}'
@@ -80,50 +50,50 @@ def build_parser() -> argparse.ArgumentParser:
         help='Subcommand to run',
     )
 
-    # Minimal subparsers; actual options belong to the downstream tools.
-    subparsers.add_parser(
+    sp_filter = subparsers.add_parser(
         'filter',
         help='Select the best miniprot alignment per locus and emit GFF3/TSV.',
-        add_help=False,  # let maxiprot.filter handle its own --help
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    subparsers.add_parser(
+    filter.add_arguments(sp_filter)
+    sp_filter.add_argument(
+        '--version', action='version', version=f'maxiprot {__version__}'
+    )
+    sp_filter.set_defaults(func=filter.run)
+
+    sp_extract = subparsers.add_parser(
         'extract',
         help='Extract protein/CDS/gene sequences from maxiprot GFF3.',
-        add_help=False,  # let maxiprot.extract handle its own --help
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    extract.add_arguments(sp_extract)
+    sp_extract.add_argument(
+        '--version', action='version', version=f'maxiprot {__version__}'
+    )
+    sp_extract.set_defaults(func=extract.run)
+
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """
-    Entrypoint. Parse the subcommand token and forward remaining args.
+    Entrypoint: parse arguments and dispatch to the selected subcommand.
+
+    Parameters
+    ----------
+    argv : Sequence[str] or None, optional
+        Argument vector to parse instead of ``sys.argv[1:]``.
+
+    Returns
+    -------
+    int
+        Exit status code.
     """
     if argv is None:
         argv = sys.argv[1:]
-
     parser = build_parser()
-    # Only parse the subcommand; forward the rest (including --help) to the sub-tool.
-    args, remainder = parser.parse_known_args(argv)
-
-    if args.command == 'filter':
-        try:
-            filter_main = _load_filter_main()
-        except (ModuleNotFoundError, TypeError) as e:
-            print(str(e), file=sys.stderr)
-            return 2
-        return int(filter_main(remainder))
-
-    if args.command == 'extract':
-        try:
-            extract_main = _load_extract_main()
-        except (ModuleNotFoundError, TypeError) as e:
-            print(str(e), file=sys.stderr)
-            return 2
-        return int(extract_main(remainder))
-
-    # Should not happen (subparsers.required=True), but keep a fallback:
-    parser.print_usage(sys.stderr)
-    return 2
+    args = parser.parse_args(argv)
+    return guard_broken_pipe(lambda: int(args.func(args)))
 
 
 if __name__ == '__main__':

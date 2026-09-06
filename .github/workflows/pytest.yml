@@ -6,50 +6,61 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: pytest-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
 
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
 
+    # NOTE: no test currently invokes miniprot itself (the integration tests
+    # use committed miniprot output under tests/data/). A future end-to-end
+    # job could install miniprot from bioconda in a dedicated job.
     steps:
-      # Checkout the latest commit associated with the PR
       - uses: actions/checkout@v6
 
-      - name: Debug matrix value
-        run: echo "Python version is ${{ matrix.python-version }}"
-
-      # Set up Miniconda
-      - name: Set up Miniconda
-        uses: conda-incubator/setup-miniconda@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
         with:
-          auto-activate: true
-          auto-update-conda: true  # Optional: update Conda to the latest version
-          channels: conda-forge,bioconda
-          conda-remove-defaults: true
           python-version: ${{ matrix.python-version }}
+          cache: pip
 
-      # Install any additional dependencies not included in the pyproject.toml file
-      - name: Install additional dependencies
+      - name: Install package
         run: |
-          conda install -y -c conda-forge -c bioconda miniprot
-          python -m pip install --upgrade pip setuptools wheel
-          python -m pip install --retries 10 --timeout 180 --prefer-binary --progress-bar off --no-cache-dir '.[test]'
-        shell: bash -l {0}
+          python -m pip install --upgrade pip
+          python -m pip install '.[test]'
 
-      # Run pytest on the specified directory
       - name: Test with pytest
-        run: |
-          pytest
-        shell: bash -l {0}
+        run: pytest --cov=maxiprot --cov-branch --cov-report=xml --cov-report=term
 
-      # Upload coverage report to Codecov
-      # Only upload coverage for the latest Python version
-      #- name: Upload coverage reports to Codecov
-      #  uses: codecov/codecov-action@v5
-      #  if: matrix.python-version == '3.13'
-      #  with:
-      #    token: ${{ secrets.CODECOV_TOKEN }}
-      #    slug: Adamtaranto/maxiprot
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v5
+        if: matrix.python-version == '3.13'
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: Adamtaranto/maxiprot
+          fail_ci_if_error: false
+
+  mypy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install package with dev extras
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install '.[dev]'
+      - name: Type-check with mypy
+        run: mypy src/maxiprot
