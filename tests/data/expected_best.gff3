@@ -1,0 +1,14 @@
+##gff-version 3
+##sequence-region ctgA 1 15000
+##sequence-region ctgB 1 6000
+ctgA	maxiprot	gene	1948	12666	.	+	.	ID=PBM:ctgA:+:1:CryptonF-1_RhMu:gene;Name=CryptonF-1_RhMu;locus=ctgA:+:1
+ctgA	miniprot	mRNA	1948	12666	70	+	.	ID=MP000001;Parent=PBM:ctgA:+:1:CryptonF-1_RhMu:gene;Rank=1;Identity=0.2141;Positive=0.3528;Frameshift=1;Target=CryptonF-1_RhMu 424 739
+ctgA	miniprot	CDS	1948	2158	36	+	0	ID=MP000001.cds;Parent=MP000001;Rank=1;Identity=0.2335;Frameshift=1;Target=CryptonF-1_RhMu 424 507
+ctgA	miniprot	CDS	11988	12666	34	+	1	ID=MP000001.cds;Parent=MP000001;Rank=1;Identity=0.2073;Target=CryptonF-1_RhMu 508 739
+ctgB	maxiprot	gene	1735	4146	.	+	.	ID=PBM:ctgB:+:1:Horizon-KAI0626734:gene;Name=Horizon-KAI0626734;locus=ctgB:+:1
+ctgB	miniprot	mRNA	1735	4146	1270	+	.	ID=MP000002;Parent=PBM:ctgB:+:1:Horizon-KAI0626734:gene;Rank=1;Identity=0.6112;Positive=0.7647;Frameshift=9;StopCodon=29;Target=Horizon-KAI0626734 12 738
+ctgB	miniprot	CDS	1735	1846	89	+	0	ID=MP000002.cds;Parent=MP000002;Rank=1;Identity=0.6053;StopCodon=1;Target=Horizon-KAI0626734 12 48
+ctgB	miniprot	CDS	1926	2166	81	+	2	ID=MP000002.cds;Parent=MP000002;Rank=1;Identity=0.6240;Frameshift=3;StopCodon=5;Target=Horizon-KAI0626734 49 131
+ctgB	miniprot	CDS	2217	2680	340	+	0	ID=MP000002.cds;Parent=MP000002;Rank=1;Identity=0.6065;StopCodon=5;Target=Horizon-KAI0626734 132 285
+ctgB	miniprot	CDS	2735	3099	189	+	1	ID=MP000002.cds;Parent=MP000002;Rank=1;Identity=0.5710;Frameshift=2;StopCodon=3;Target=Horizon-KAI0626734 286 409
+ctgB	miniprot	CDS	3158	4146	571	+	2	ID=MP000002.cds;Parent=MP000002;Rank=1;Identity=0.6261;Frameshift=4;StopCodon=15;Target=Horizon-KAI0626734 410 738

@@ -55,7 +55,7 @@ maxiprot filter miniprot.gff3 1> best_per_locus.gff3
 
 ## Installation
 
-Requirements: Python 3.8+, biopython, pandas and pyfaidx.
+Requirements: Python 3.10+, biopython, numpy, pandas, pyfaidx and rich.
 
 Installation options:
 
@@ -115,6 +115,8 @@ Columns include:
 
 `--score-mode` controls how candidates are ranked **within a locus** (after gates). You can also **gate** with `--min-cov` (default 0.60) and `--min-pid` (default 0.30).
 
+Gates always **exclude** failing candidates from selection. If no candidate at a locus passes, the locus is dropped under `--strict`; otherwise its single best-scoring candidate is emitted as a fallback, flagged `passes=False` in the TSV.
+
 Common ingredients:
 
 - **`pid_aa`**: identical AA fraction from `cs:Z:`
@@ -151,7 +153,9 @@ Common ingredients:
    `w_pid×pid + w_cov×cov + w_pos×positives + w_ms×ms_per_qlen + w_AS×AS_per_qlen + w_len×length`
 
 8. **`geom`**
-   Weighted geometric product (weights act as exponents). Rewards **balanced** candidates; any near‑zero factor drags the score down.
+   Weighted geometric product (weights act as exponents) over the ingredients with **positive weights**. Rewards **balanced** candidates; any near‑zero factor drags the score down. Factors are clamped to ≥1e‑9 before exponentiation so zero/negative ingredients can't produce NaN; requesting `geom` with all weights zero is an error.
+
+**Missing tags**: if a record lacks `cs:Z`, identity falls back to `nmatch/alen` and aligned length to `qend-qstart`; a missing `ms:i`/`AS:i` falls back along `AS → ms → nmatch` (warned once); a missing `np:i` makes `positives` 0. Note `len_frac` (gap-excluded aligned AA fraction) is deliberately distinct from `cov_aa` (span-based).
 
 ---
 
@@ -171,11 +175,11 @@ Common ingredients:
 
 ## Locus clustering
 
-Hits are clustered into loci by **target** (`tname`) and **strand**. A new locus starts when the next hit begins more than `--locus-pad` nt after the running end of the current locus.
+Hits are clustered into loci by **target** (`tname`) and **strand**. A new locus starts when the next hit begins more than `--locus-pad` nt after the running end of the current locus. Locus labels have the form `tname:strand:index`.
 
 - `--locus-pad` (alias `--locus-gap`) default: `5000`
 
-Tune this upward for fragmented assemblies or long introns; downward to split nearby tandem copies.
+Clustering is single-linkage chaining: a run of tandem gene copies each spaced closer than `--locus-pad` merges into **one** locus (and `--emit-mode best` then emits one gene for the whole array). Tune `--locus-pad` upward for fragmented assemblies or long introns; downward to split nearby tandem copies, or use `--emit-mode all_passing` to keep every passing copy.
 
 ---
 
@@ -202,11 +206,16 @@ locus:
 selection:
   --selection-mode {best,prefer_intact,longest,longest_prefer_intact}
 
+emission:
+  --emit-mode {best,all_passing}     (default best: one winner per locus)
+  --max-per-locus N                  (cap for all_passing)
+
 output:
   --id-prefix PBM
   --out-gff3 -                       (stdout by default)
-  --out-tsv  None                    (stderr by default)
-  --log-level INFO
+  --out-tsv FILE                     (not written by default; '-' = stdout,
+                                      only when --out-gff3 is a file)
+  --log-level {DEBUG,INFO,WARNING,ERROR,CRITICAL}
 
 ```
 
@@ -282,7 +291,7 @@ Extract protein sequences from the **GFF3 output of** `maxiprot` by pulling and 
 - Input: GFF3 from `maxiprot` (file or stdin)
 - Output: **FASTA to stdout** by default (or --out-faa PATH)
 - Genome FASTA may be **plain or bgzip-compressed** (.bgz); .fai index auto-created with pyfaidx if missing
-- Choose **NCBI translation table**: `--transl-table` (default `1`; also supports `2`, `4`, `11`)
+- Choose **NCBI translation table**: `--transl-table` (default `1`; all NCBI tables supported via Biopython)
 - **Exclude pseudogenes**: --exclude-pseudogenes skips proteins with internal `*`
 - **Max annotations per contig** filter: `--max-annos-per-contig N` (e.g., `1` to enforce exclusivity)
 - Warnings for: CDS length not divisible by 3; non-ATGC bases in CDS
@@ -332,11 +341,10 @@ If `*` appears **internally** in the translation and `--exclude-pseudogenes` is 
 
 `--log-level` controls verbosity. For each locus, the log prints:
 
-- number of candidates
-- per candidate summary: **score**, **cov**, **pid**, **lenAA**, **positives**, **ms**, **AS**, **fs**, **st**, pass/fail, intact/pseudogene
-- the **selected** candidate and the global settings used
+- number of candidates (DEBUG)
+- the **selected** candidate per locus with score/cov/pid/length and pass status
 
-Note: Because maxiprot writes TSV to stderr by default, logs may interleave; set --log-level ERROR or redirect log streams separately in production pipelines.
+Logs go to **stderr** only; data outputs (GFF3, TSV) never share a stream with logs.
 
 ---
 
@@ -368,11 +376,6 @@ When using the workflow described in this README please cite the `maxiprot` GitH
 
 ---
 
-## Changelog (short)
+## Changelog
 
-- **0.6.0**
-  - Restructure as package with single `maxiprot` entrypoint.
-  - Sub-modules `maxiprot filter` and `maxiprot extract`
-- **0.5.0**
-  - maxiprot now writes GFF3 to stdout and TSV to stderr by default.
-  - New companion script maxiprot_extract_proteins to translate CDS to protein FASTA.
+See [CHANGELOG.md](CHANGELOG.md).

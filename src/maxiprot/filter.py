@@ -1,674 +1,560 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 Pick the best miniprot alignment per locus from a miniprot GFF3.
 
-Default outputs:
-- GFF3 → **stdout** (unless --out-gff3 PATH is provided)
-- TSV  → **stderr** (unless --out-tsv PATH is provided)
-
-This tool reads a miniprot GFF3 that includes ``##PAF`` header lines, computes
-alignment metrics, applies user-configurable scoring and gating, clusters
-alignments into loci on the same sequence/strand, and selects one "best" or
-"longest" candidate per locus.
+Reads a miniprot GFF3 that includes ``##PAF`` header lines, computes
+alignment metrics (identity from ``cs:Z``, query coverage, positives from
+``np:i``), applies user-configurable scoring and gating, clusters alignments
+into loci on the same sequence/strand, and selects candidates per locus.
 
 Outputs
 -------
-1) A GFF3 (to stdout by default) with a valid gene → mRNA → CDS hierarchy for
-   the chosen candidate in each locus. Multi-line CDS features **share the same ID**,
-   as required by the GFF3 specification.
-2) A TSV summary (to stderr by default) with one row per chosen locus.
+1) A GFF3 (stdout by default) with a valid gene -> mRNA -> CDS hierarchy for
+   each emitted candidate. Multi-line CDS features **share the same ID**, as
+   required by the GFF3 specification.
+2) An optional TSV summary (only with ``--out-tsv``; ``-`` = stdout) with one
+   row per emitted candidate.
 
 Notes
 -----
-- Requires miniprot GFF with ``##PAF`` header lines (contains tags like
-  ``AS:i``, ``ms:i``, ``np:i``, ``fs:i``, ``st:i``, ``cg:Z``, ``cs:Z``).
-- Coverage gate is applied to *reference (query) protein* coverage.
-- Identity is computed from ``cs:Z:`` as identical-AA count divided by aligned AA.
+- Requires miniprot GFF with ``##PAF`` header lines (tags like ``AS:i``,
+  ``ms:i``, ``np:i``, ``fs:i``, ``st:i``, ``cs:Z``).
+- Coverage is computed on the *reference protein* (query): ``(qe - qs)/qlen``.
 """
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import logging
-import re
-import sys
-from typing import Dict, List, Optional, Sequence, TextIO, Tuple
+from typing import Optional, Sequence
 
 import pandas as pd
 
-from maxiprot._version import __version__
+from maxiprot.emit import write_best_gff3
+from maxiprot.gffio import GffFeature, PafRecord, iter_gff3
+from maxiprot.ioutils import guard_broken_pipe, open_output, read_lines
+from maxiprot.logs import LOG_LEVELS, init_logging
+from maxiprot.scoring import (
+    SCORE_MODES,
+    Weights,
+    compute_alignment_metrics,
+    compute_scores,
+)
+
+logger = logging.getLogger(__name__)
+
+PAF_CORE_COLS = (
+    'qname',
+    'qlen',
+    'qs',
+    'qe',
+    'strand',
+    'tname',
+    'tlen',
+    'ts',
+    'te',
+    'nmatch',
+    'alen',
+    'mapq',
+)
+
+TSV_COLUMNS = (
+    'locus',
+    'tname',
+    'tstart',
+    'tend',
+    'strand',
+    'qname',
+    'qlen',
+    'cov_aa',
+    'pid_aa',
+    'positives',
+    'ms',
+    'AS',
+    'score_raw',
+    'cds_aa_len',
+    'fs',
+    'st',
+    'status',
+    'mrna_id',
+    'gff_cds_nt_len',
+    'passes',
+    'mapq',
+)
+
 
 # ---------------------------------------------------------------------------
-# Regexes reused across functions (compiled once)
-# ---------------------------------------------------------------------------
-
-_RE_CG = re.compile(r'(\d+)([MIDNUVFG])')
-_RE_CS_MATCHES = re.compile(r':(\d+)')  # e.g., ':128' blocks -> identical AA counts
-_RE_CS_SUBS = re.compile(
-    r'\*'
-)  # '*' ops -> mismatches/substitutions (not used in score)
-
-
-# ---------------------------------------------------------------------------
-# Data containers
+# Input
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class ParsedCg:
+def load_input(
+    path: Optional[str],
+) -> tuple[pd.DataFrame, dict[str, GffFeature], dict[str, list[GffFeature]]]:
     """
-    Parsed components of miniprot PAF ``cg:Z`` string.
+    Stream a miniprot GFF3 and collect PAF records plus mRNA/CDS features.
 
     Parameters
     ----------
-    M, I, D, G : int
-        Amino acid operation lengths for Match, Insertion, Deletion, and 'G'.
-        We treat M/I/D/G as contributing to aligned AA length.
-    intron_nt : int
-        Total intronic nucleotides (N/U/V ops) for reporting; not used in scoring.
-    """
-
-    M: int = 0
-    I: int = 0
-    D: int = 0
-    G: int = 0
-    intron_nt: int = 0
-
-
-# ---------------------------------------------------------------------------
-# Utilities & parsing
-# ---------------------------------------------------------------------------
-
-
-def parse_cg(cg: Optional[str]) -> ParsedCg:
-    """
-    Parse a miniprot ``cg:Z`` string into operation counts."""
-    if not isinstance(cg, str):
-        return ParsedCg()
-    M = I = D = G = intron_nt = 0
-    for n_str, op in _RE_CG.findall(cg):
-        n = int(n_str)
-        if op == 'M':
-            M += n
-        elif op == 'I':
-            I += n
-        elif op == 'D':
-            D += n
-        elif op == 'G':
-            G += n
-        elif op in ('N', 'U', 'V'):
-            intron_nt += n
-    return ParsedCg(M=M, I=I, D=D, G=G, intron_nt=intron_nt)
-
-
-def parse_cs(cs: Optional[str]) -> Tuple[int, int]:
-    """
-    Parse a miniprot ``cs:Z`` string to count identity and substitutions.
+    path : str or None
+        Input path, or ``'-'``/None for stdin.
 
     Returns
     -------
-    (int, int)
-        (identical_aa_count, substitution_count)
+    tuple
+        ``(paf_df, mrna_by_id, cds_by_parent)`` where ``paf_df`` has the PAF
+        core columns plus one column per tag seen in the input.
     """
-    if not isinstance(cs, str):
-        return 0, 0
-    aa_ident = sum(map(int, _RE_CS_MATCHES.findall(cs)))
-    aa_subs = len(_RE_CS_SUBS.findall(cs))
-    return aa_ident, aa_subs
+    paf_rows: list[dict[str, object]] = []
+    mrna_by_id: dict[str, GffFeature] = {}
+    cds_by_parent: dict[str, list[GffFeature]] = {}
 
+    for item in iter_gff3(read_lines(path)):
+        if isinstance(item, PafRecord):
+            row: dict[str, object] = {col: getattr(item, col) for col in PAF_CORE_COLS}
+            row.update(item.tags)
+            paf_rows.append(row)
+        elif item.type == 'mRNA':
+            fid = item.attrs.get('ID')
+            if fid:
+                if fid in mrna_by_id:
+                    logger.warning('Duplicate mRNA ID in input: %s', fid)
+                mrna_by_id[fid] = item
+        elif item.type == 'CDS':
+            parent = item.attrs.get('Parent')
+            if parent:
+                cds_by_parent.setdefault(parent, []).append(item)
 
-def read_lines(source: str) -> List[str]:
-    """
-    Read all lines from a file path or stdin."""
-    if source == '-' or source is None:
-        return sys.stdin.read().splitlines()
-    with open(source, 'r', encoding='utf-8') as fh:
-        return fh.read().splitlines()
-
-
-def read_paf_from_gff_lines(lines: Sequence[str]) -> pd.DataFrame:
-    """
-    Extract PAF-like fields from GFF3 ``##PAF\t...`` header lines."""
-    rows: List[Dict[str, object]] = []
-
-    def to_int(k: str) -> int:
-        try:
-            return int(tagd.get(k, 0))
-        except Exception:
-            return 0
-
-    for ln in lines:
-        if not ln:
-            continue
-        if ln.startswith('##PAF'):
-            parts = ln.split('\t')[1:]
-        else:
-            continue
-        if len(parts) < 12:
-            continue
-        core = parts[:12]
-        tags = parts[12:]
-        qname = core[0]
-        qlen = int(core[1])
-        qstart = int(core[2])
-        qend = int(core[3])
-        strand = core[4]
-        tname = core[5]
-        tlen = int(core[6])
-        tstart = int(core[7])
-        tend = int(core[8])
-        nmatch_nt = int(core[9])
-        aln_nt_no_introns = int(core[10])
-        mapq = int(core[11])
-        tagd: Dict[str, str] = {}
-        for kv in tags:
-            if kv.count(':') >= 2:
-                k, _typ, val = kv.split(':', 2)
-                tagd[k] = val
-
-        rows.append(
-            {
-                'qname': qname,
-                'qlen': qlen,
-                'qstart': qstart,
-                'qend': qend,
-                'strand': strand,
-                'tname': tname,
-                'tlen': tlen,
-                'tstart': tstart,
-                'tend': tend,
-                'nmatch_nt': nmatch_nt,
-                'aln_nt_no_introns': aln_nt_no_introns,
-                'mapq': mapq,
-                'AS': to_int('AS'),
-                'ms': to_int('ms'),
-                'np': to_int('np'),
-                'fs': to_int('fs'),
-                'st': to_int('st'),
-                'cg': tagd.get('cg'),
-                'cs': tagd.get('cs'),
-            }
-        )
-    if not rows:
-        raise SystemExit(
-            'ERROR: No PAF header lines (##PAF) found. '
-            'Run miniprot with GFF output that includes PAF headers.'
-        )
-    return pd.DataFrame(rows)
-
-
-def read_gff_features(lines: Sequence[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Parse mRNA and CDS features from miniprot GFF3 body lines.
-    """
-    mrows: List[Dict[str, object]] = []
-    crows: List[Dict[str, object]] = []
-    for ln in lines:
-        if not ln or ln.startswith('#'):
-            continue
-        parts = ln.split('\t')
-        if len(parts) < 9:
-            continue
-        seqid, source, ftype, start, end, score, strand, phase, attrs = parts[:9]
-        start_i, end_i = int(start), int(end)
-
-        # Attribute parsing (tolerant)
-        ad: Dict[str, str] = {}
-        for kv in attrs.strip().split(';'):
-            if '=' in kv:
-                k, v = kv.split('=', 1)
-                ad[k] = v
-
-        if ftype == 'mRNA':
-            tgt = ad.get('Target', '')
-            tgt_qname = tgt.split()[0] if tgt else None
-            mrows.append(
-                {
-                    'seqid': seqid,
-                    'source': source,
-                    'start': start_i,
-                    'end': end_i,
-                    'strand': strand,
-                    'score': score,
-                    'phase': phase,
-                    'attrs': ad,
-                    'mrna_id': ad.get('ID'),
-                    'target_qname': tgt_qname,
-                }
-            )
-        elif ftype == 'CDS':
-            crows.append(
-                {
-                    'seqid': seqid,
-                    'source': source,
-                    'start': start_i,
-                    'end': end_i,
-                    'strand': strand,
-                    'score': score,
-                    'phase': phase,
-                    'attrs': ad,
-                    'parent': ad.get('Parent'),
-                    'raw_attr': attrs,
-                }
-            )
-
-    mdf = pd.DataFrame(mrows)
-    cdf = pd.DataFrame(crows)
-    if not cdf.empty:
-        cdf['len_nt'] = cdf['end'] - cdf['start'] + 1
-    return mdf, cdf
+    paf = pd.DataFrame.from_records(paf_rows)
+    return paf, mrna_by_id, cds_by_parent
 
 
 # ---------------------------------------------------------------------------
-# Metrics & scoring
+# Gating
 # ---------------------------------------------------------------------------
 
 
-def add_alignment_metrics(df: pd.DataFrame) -> pd.DataFrame:
+def apply_gates(df: pd.DataFrame, min_cov: float, min_pid: float) -> pd.Series:
     """
-    Append derived alignment metrics to the PAF dataframe.
+    Apply pass/fail gates for coverage and percent identity.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Dataframe with columns ``cov_aa`` and ``pid_aa``.
+    min_cov : float
+        Minimum fraction of reference coverage required (0-1).
+    min_pid : float
+        Minimum AA identity required (0-1).
+
+    Returns
+    -------
+    pandas.Series
+        Boolean series indicating pass/fail per row.
     """
-    cg_parsed = df['cg'].apply(parse_cg)
-    df[['M', 'I', 'D', 'G', 'intron_nt']] = pd.DataFrame(
-        [(p.M, p.I, p.D, p.G, p.intron_nt) for p in cg_parsed], index=df.index
+    return (df['cov_aa'] >= min_cov) & (df['pid_aa'] >= min_pid)
+
+
+def gate_intact_v_pseudo(df: pd.DataFrame) -> pd.Series:
+    """
+    Label candidates as intact (no frameshifts / in-frame stops) or not.
+
+    Missing ``fs``/``st`` tags are treated as 0 (intact).
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        PAF dataframe; ``fs`` and ``st`` columns are optional.
+
+    Returns
+    -------
+    pandas.Series
+        Boolean series, True for intact.
+    """
+    fs = _tag_series(df, 'fs')
+    st = _tag_series(df, 'st')
+    return (fs == 0) & (st == 0)
+
+
+def _tag_series(df: pd.DataFrame, col: str) -> pd.Series:
+    """Return an integer tag column, defaulting missing values to 0."""
+    if col in df.columns:
+        return pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
+    return pd.Series(0, index=df.index, dtype=int)
+
+
+# ---------------------------------------------------------------------------
+# Locus clustering
+# ---------------------------------------------------------------------------
+
+
+def cluster_into_loci(paf: pd.DataFrame, locus_pad: int = 5000) -> pd.DataFrame:
+    """
+    Group alignments into loci on the same (tname, strand) within distance.
+
+    Clustering is single-linkage chaining: a new locus starts when the next
+    hit begins more than ``locus_pad`` nt after the running end of the current
+    locus. Overlapping hits always share a locus. Tandem copies spaced closer
+    than ``locus_pad`` therefore merge into one locus.
+
+    Parameters
+    ----------
+    paf : pandas.DataFrame
+        PAF-like dataframe (must have 'tname', 'strand', 'ts', 'te').
+    locus_pad : int, default 5000
+        Maximum gap (nt) joining consecutive hits into one locus.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Input sorted by (tname, strand, ts, te) with an added ``locus`` label
+        of the form ``tname:strand:index`` (index is 1-based per
+        (tname, strand) group, in coordinate order).
+    """
+    df = paf.copy()
+    if df.empty:
+        df['locus'] = pd.Series(dtype=str)
+        return df
+
+    df = df.sort_values(['tname', 'strand', 'ts', 'te'], kind='mergesort')
+    group_keys = [df['tname'], df['strand']]
+    running_end = df.groupby(['tname', 'strand'], sort=False)['te'].cummax()
+    prev_end = running_end.groupby(group_keys, sort=False).shift()
+    new_locus = prev_end.isna() | (df['ts'] > prev_end + locus_pad)
+    index_in_group = new_locus.groupby(group_keys, sort=False).cumsum().astype(int)
+    df['locus'] = (
+        df['tname'].astype(str)
+        + ':'
+        + df['strand'].astype(str)
+        + ':'
+        + index_in_group.astype(str)
     )
-    df['aa_aligned'] = (df['M'] + df['I'] + df['D'] + df['G']).clip(lower=1)
-    ident_subs = df['cs'].apply(parse_cs)
-    df[['aa_ident', 'aa_subs']] = pd.DataFrame(list(ident_subs), index=df.index)
-    df['cov_aa'] = (df['qend'] - df['qstart']) / df['qlen'].clip(lower=1)
-    df['pid_aa'] = (df['aa_ident'] / df['aa_aligned']).clip(0, 1)
-    df['positives'] = (df['np'] / df['aa_aligned']).clip(0, 1)
-    df['ms_per_qlen'] = df['ms'] / df['qlen'].clip(lower=1)
-    df['AS_per_qlen'] = df['AS'] / df['qlen'].clip(lower=1)
-    df['len_frac'] = df['aa_aligned'] / df['qlen'].clip(lower=1)
-    df['cds_aa_len'] = df['aa_aligned']
     return df
 
 
-def _linear(row: pd.Series, args: argparse.Namespace, length_metric: str) -> float:
-    return (
-        args.w_pid * float(row['pid_aa'])
-        + args.w_cov * float(row['cov_aa'])
-        + args.w_pos * float(row['positives'])
-        + args.w_ms * float(row['ms_per_qlen'])
-        + args.w_AS * float(row['AS_per_qlen'])
-        + args.w_len * float(row[length_metric])
-    )
-
-
-def _geom(
-    row: pd.Series, args: argparse.Namespace, length_metric: str, eps: float = 1e-9
-) -> float:
-    factors: List[float] = []
-    for w, val in (
-        (args.w_pid, float(row['pid_aa'])),
-        (args.w_cov, float(row['cov_aa'])),
-        (args.w_pos, float(row['positives'])),
-        (args.w_ms, float(row['ms_per_qlen'])),
-        (args.w_AS, float(row['AS_per_qlen'])),
-        (args.w_len, float(row[length_metric])),
-    ):
-        if w != 0:
-            factors.append(max(val, eps) ** w)
-    if not factors:
-        return 0.0
-    prod = 1.0
-    for f in factors:
-        prod *= f
-    return float(prod)
-
-
-def score_alignment(row: pd.Series, mode: str, args: argparse.Namespace) -> float:
-    """
-    Compute a score for a candidate row.
-    """
-    length_metric = 'len_frac' if args.length_metric == 'frac' else 'cds_aa_len'
-
-    if mode == 'ms_cov_pos':
-        return (
-            float(row['ms_per_qlen'])
-            * float(row['cov_aa'])
-            * (0.5 + 0.5 * float(row['positives']))
-        )
-    if mode == 'AS':
-        return float(row['AS_per_qlen'])
-    if mode == 'ms':
-        return float(row['ms_per_qlen'])
-    if mode == 'pid_cov':
-        return float(row['pid_aa']) * float(row['cov_aa'])
-    if mode == 'pid_cov_len':
-        return (
-            (float(row['pid_aa']) ** max(args.w_pid, 0.0))
-            * (float(row['cov_aa']) ** max(args.w_cov, 0.0))
-            * (float(row[length_metric]) ** max(args.w_len, 0.0))
-        )
-    if mode == 'length':
-        return float(row[length_metric])
-    if mode == 'linear':
-        return _linear(row, args, length_metric)
-    if mode == 'geom':
-        return _geom(row, args, length_metric)
-
-    return (
-        float(row['ms_per_qlen'])
-        * float(row['cov_aa'])
-        * (0.5 + 0.5 * float(row['positives']))
-    )
-
-
-def apply_gates(
-    df: pd.DataFrame, cov_min: float = 0.60, pid_min: float = 0.30
-) -> pd.DataFrame:
-    """Apply gating thresholds for coverage and identity."""
-    out = df.copy()
-    out['passes'] = (out['cov_aa'] >= cov_min) & (out['pid_aa'] >= pid_min)
-    return out
-
-
-def cluster_into_loci(df: pd.DataFrame, pad_nt: int = 5000) -> pd.DataFrame:
-    """Cluster hits into loci along each target sequence and strand."""
-    out = df.copy()
-    out['locus'] = None
-    for (tname, strand), sub in df.sort_values(
-        ['tname', 'strand', 'tstart', 'tend']
-    ).groupby(['tname', 'strand'], sort=False):
-        current_end = -(10**18)
-        cid = 0
-        for i, r in sub.iterrows():
-            if r.tstart <= current_end + pad_nt:
-                current_end = max(current_end, r.tend)
-            else:
-                cid += 1
-                current_end = r.tend
-            out.at[i, 'locus'] = f'{tname}:{strand}:{cid}'
-    return out
-
-
 # ---------------------------------------------------------------------------
-# Mapping winners back to GFF features
+# Per-locus selection
 # ---------------------------------------------------------------------------
 
 
-def jaccard(a0: int, a1: int, b0: int, b1: int) -> float:
-    """
-    Compute Jaccard index for two closed intervals [a0,a1], [b0,b1].
-    """
-    inter = max(0, min(a1, b1) - max(a0, b0) + 1)
-    uni = (a1 - a0 + 1) + (b1 - b0 + 1) - inter
-    return inter / uni if uni > 0 else 0.0
-
-
-def attach_mrna_and_cds_length(
-    winners: pd.DataFrame, mdf: pd.DataFrame, cdf: pd.DataFrame
+def select_per_locus(
+    df: pd.DataFrame,
+    selection_mode: str = 'best',
+    emit_mode: str = 'best',
+    max_per_locus: Optional[int] = None,
+    strict: bool = False,
 ) -> pd.DataFrame:
     """
-    Find the matching mRNA in the GFF and compute total CDS span for winners.
+    Select candidates to emit for each locus.
+
+    Gates always exclude failing candidates from selection. A locus with no
+    passing candidate is dropped under ``strict``; otherwise its single
+    best-scoring candidate is emitted (flagged ``passes=False`` in the TSV).
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Scored, gated, clustered candidates (columns ``locus``, ``passes``,
+        ``intact``, ``score_raw``, ``cds_aa_len``).
+    selection_mode : str
+        'best', 'prefer_intact', 'longest' or 'longest_prefer_intact'.
+    emit_mode : str
+        'best' (one winner per locus) or 'all_passing'.
+    max_per_locus : int or None
+        Cap on emitted candidates per locus for 'all_passing'.
+    strict : bool
+        Drop loci where no candidate passes gates.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Winners with an added 1-based ``emit_rank`` column per locus.
     """
-    mrna_ids: List[Optional[str]] = []
-    cds_sums: List[Optional[int]] = []
-
-    for _, r in winners.iterrows():
-        cand = mdf[
-            (mdf['seqid'] == r['tname'])
-            & (mdf['strand'] == r['strand'])
-            & (mdf['target_qname'] == r['qname'])
-        ]
-        if cand.empty:
-            mrna_ids.append(None)
-            cds_sums.append(None)
-            continue
-        cand = cand.copy()
-        cand['ovl'] = cand.apply(
-            lambda x, tstart=int(r['tstart']), tend=int(r['tend']): jaccard(
-                tstart, tend, int(x['start']), int(x['end'])
-            ),
-            axis=1,
-        )
-        cand = cand.sort_values('ovl', ascending=False)
-        mrna_id = (
-            str(cand.iloc[0]['mrna_id'])
-            if not cand.empty and cand.iloc[0]['ovl'] > 0
-            else None
-        )
-        if mrna_id and not cdf.empty:
-            cds_sum = int(cdf.loc[cdf['parent'] == mrna_id, 'len_nt'].sum())
-        else:
-            cds_sum = None
-        mrna_ids.append(mrna_id)
-        cds_sums.append(cds_sum)
-
-    out = winners.copy()
-    out['mrna_id'] = mrna_ids
-    out['gff_cds_nt_len'] = cds_sums
-    return out
-
-
-# ---------------------------------------------------------------------------
-# GFF3 writing
-# ---------------------------------------------------------------------------
-
-
-def gff3_escape(s: str) -> str:
-    """
-    Escape attribute values for GFF3 (percent-first order).
-    """
-    return (
-        s.replace('%', '%25')
-        .replace(';', '%3B')
-        .replace('=', '%3D')
-        .replace(',', '%2C')
-        .replace('&', '%26')
-    )
-
-
-def _open_out_handle(path: Optional[str], default: TextIO) -> Tuple[TextIO, bool]:
-    """
-    Return a writable handle and whether we own/should close it.
-    """
-    if path is None or path == '-' or path == '':
-        return default, False
-    fh = open(path, 'w', encoding='utf-8')
-    return fh, True
-
-
-def write_best_gff3(
-    out_path: Optional[str],
-    winners: pd.DataFrame,
-    mdf: pd.DataFrame,
-    cdf: pd.DataFrame,
-    id_prefix: str = 'PBM',
-) -> None:
-    """
-    Write the best-per-locus annotations as a valid GFF3 hierarchy.
-
-    If ``out_path`` is None/'-' -> write to stdout.
-    """
-    out, close_me = _open_out_handle(out_path, sys.stdout)
-    try:
-        out.write('##gff-version 3\n')
-        for _, r in winners.iterrows():
-            if pd.isna(r.get('mrna_id')):
-                # Synthesize a minimal hierarchy from PAF coords.
-                gene_id = f'{id_prefix}:gene:{gff3_escape(str(r["locus"]))}'
-                mrna_id = f'{id_prefix}:mrna:{gff3_escape(str(r["locus"]))}'
-                seqid = str(r['tname'])
-                strand = str(r['strand'])
-                start = int(min(r['tstart'], r['tend']))
-                end = int(max(r['tstart'], r['tend']))
-                out.write(
-                    f'{seqid}\tminiprot\tgene\t{start}\t{end}\t.\t{strand}\t.\tID={gene_id};Name={gene_id}\n'
-                )
-                attrs = f'ID={mrna_id};Parent={gene_id};Target={gff3_escape(str(r["qname"]))} {int(r["qstart"]) + 1} {int(r["qend"])}'
-                out.write(
-                    f'{seqid}\tminiprot\tmRNA\t{start}\t{end}\t.\t{strand}\t.\t{attrs}\n'
-                )
-                cds_id = f'{id_prefix}:cds:{gff3_escape(str(r["locus"]))}'
-                out.write(
-                    f'{seqid}\tminiprot\tCDS\t{start}\t{end}\t.\t{strand}\t0\tID={cds_id};Parent={mrna_id}\n'
+    frames: list[pd.DataFrame] = []
+    for locus, sub in df.groupby('locus', sort=False):
+        logger.debug('[Locus %s] %d candidate(s)', locus, len(sub))
+        passers = sub[sub['passes']]
+        if passers.empty:
+            if strict:
+                logger.info(
+                    '[Locus %s] no candidates pass gates -> dropped (--strict)',
+                    locus,
                 )
                 continue
-
-            mrna_id = str(r['mrna_id'])
-            m = mdf.loc[mdf['mrna_id'] == mrna_id].iloc[0]
-            seqid = str(m['seqid'])
-            strand = str(m['strand'])
-            start = int(min(m['start'], m['end']))
-            end = int(max(m['start'], m['end']))
-
-            gene_id = f'{id_prefix}:gene:{gff3_escape(str(r["locus"]))}'
-            out.write(
-                f'{seqid}\tminiprot\tgene\t{start}\t{end}\t.\t{strand}\t.\tID={gene_id};Name={gene_id}\n'
+            logger.info(
+                '[Locus %s] no candidates pass gates -> emitting best-scoring '
+                'candidate as fallback',
+                locus,
             )
+            pool = sub
+            fallback = True
+        else:
+            pool = passers
+            fallback = False
 
-            # mRNA: preserve Target and Identity if present
-            attrs = [f'ID={mrna_id}', f'Parent={gene_id}']
-            tgt = m['attrs'].get('Target')
-            if tgt:
-                attrs.append(f'Target={gff3_escape(str(tgt))}')
-            ident = m['attrs'].get('Identity')
-            if ident:
-                attrs.append(f'Identity={ident}')
-            out.write(
-                f'{seqid}\tminiprot\tmRNA\t{start}\t{end}\t.\t{strand}\t.\t{";".join(attrs)}\n'
+        if emit_mode == 'all_passing' and not fallback:
+            emit = pool.sort_values(
+                ['score_raw', 'cds_aa_len'], ascending=[False, False]
             )
+            if max_per_locus is not None and max_per_locus > 0:
+                emit = emit.head(max_per_locus)
+        else:
+            working = pool
+            if selection_mode in ('prefer_intact', 'longest_prefer_intact'):
+                intact = working[working['intact']]
+                if not intact.empty:
+                    working = intact
+            if selection_mode in ('longest', 'longest_prefer_intact'):
+                keys = ['cds_aa_len', 'score_raw']
+            else:
+                keys = ['score_raw', 'cds_aa_len']
+            emit = working.sort_values(keys, ascending=[False, False]).head(1)
 
-            # Multi-line CDS must share the same ID
-            cds_id = f'{id_prefix}:cds:{gff3_escape(mrna_id)}'
-            cds_parts = cdf.loc[cdf['parent'] == mrna_id].sort_values(['start', 'end'])
-            for _, c in cds_parts.iterrows():
-                cstart, cend = int(c['start']), int(c['end'])
-                phase = str(c['phase']) if str(c['phase']) in ('0', '1', '2') else '0'
-                out.write(
-                    f'{seqid}\tminiprot\tCDS\t{cstart}\t{cend}\t.\t{strand}\t{phase}\tID={cds_id};Parent={mrna_id}\n'
-                )
-    finally:
-        if close_me:
-            out.close()
+        for _, pick in emit.iterrows():
+            logger.info(
+                '[Locus %s] SELECTED q=%s (score=%.5f cov=%.3f pid=%.3f lenAA=%d passes=%s)',
+                locus,
+                pick['qname'],
+                float(pick['score_raw']),
+                float(pick['cov_aa']),
+                float(pick['pid_aa']),
+                int(pick['cds_aa_len']),
+                'Y' if pick['passes'] else 'N',
+            )
+        frames.append(emit)
+
+    if not frames:
+        return df.head(0).assign(emit_rank=pd.Series(dtype=int))
+    winners = pd.concat(frames)
+    winners['emit_rank'] = winners.groupby('locus').cumcount() + 1
+    return winners
 
 
 # ---------------------------------------------------------------------------
-# CLI / main
+# Linking winners back to input mRNA features
 # ---------------------------------------------------------------------------
 
 
-def configure_logging(level: str = 'INFO') -> None:
+def _parse_target_name(s: Optional[str]) -> Optional[str]:
+    """Return the first token of a GFF3 Target attribute."""
+    if not s:
+        return None
+    s = str(s).strip()
+    if not s:
+        return None
+    return s.split()[0]
+
+
+def _interval_overlap(a1: int, a2: int, b1: int, b2: int) -> int:
+    """1-based inclusive intervals; return overlap length (>=0)."""
+    return max(0, min(a2, b2) - max(a1, b1) + 1)
+
+
+def attach_mrna_ids_to_winners(
+    winners: pd.DataFrame,
+    mrna_by_id: dict[str, GffFeature],
+    cds_by_parent: dict[str, list[GffFeature]],
+    overlap_thresh: float = 0.5,
+) -> pd.DataFrame:
     """
-    Configure root logger with a standard format (logs to stderr).
+    Attach ``mrna_id`` to winners by Target name and/or coordinate overlap.
+
+    Strategy:
+      1) Target name == PAF qname on the same seqid/strand, requiring a
+         positive coordinate overlap (largest overlap wins).
+      2) Otherwise the mRNA with the largest overlap of its CDS-union span
+         with the PAF interval, accepted when
+         ``overlap / min(len(paf), len(mrna_span)) >= overlap_thresh``.
+
+    Parameters
+    ----------
+    winners : pandas.DataFrame
+        Winner rows (``tname``, ``strand``, ``ts``, ``te``, ``qname``).
+    mrna_by_id : dict of str to GffFeature
+        Input mRNA features keyed by ID.
+    cds_by_parent : dict of str to list of GffFeature
+        Input CDS features grouped by Parent.
+    overlap_thresh : float
+        Minimum overlap fraction for the coordinate fallback.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Winners with an ``mrna_id`` column (None where unmatched).
     """
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format='%(asctime)s [%(levelname)s] %(message)s',
-        stream=sys.stderr,
+    winners = winners.copy()
+
+    # (seqid, strand) -> list of (mrna_id, span_start, span_end, target_name)
+    by_key: dict[tuple[str, str], list[tuple[str, int, int, Optional[str]]]] = {}
+    for fid, feat in mrna_by_id.items():
+        parts = cds_by_parent.get(fid, [])
+        if parts:
+            span_start = min(p.start for p in parts)
+            span_end = max(p.end for p in parts)
+        else:
+            span_start, span_end = feat.start, feat.end
+        target_name = _parse_target_name(feat.attrs.get('Target'))
+        by_key.setdefault((feat.seqid, feat.strand), []).append(
+            (fid, span_start, span_end, target_name)
+        )
+
+    mrna_ids: list[Optional[str]] = []
+    for _, w in winners.iterrows():
+        candidates = by_key.get((str(w['tname']), str(w['strand'])), [])
+        paf_start = int(w['ts']) + 1
+        paf_end = int(w['te'])
+        paf_len = max(0, paf_end - paf_start + 1)
+        qname = str(w['qname'])
+
+        chosen: Optional[str] = None
+        best_ov = 0
+        for fid, s, e, tn in candidates:
+            if tn is not None and tn == qname:
+                ov = _interval_overlap(paf_start, paf_end, s, e)
+                if ov > best_ov:
+                    best_ov = ov
+                    chosen = fid
+
+        if chosen is None:
+            best = (0.0, 0)
+            best_fid: Optional[str] = None
+            for fid, s, e, _tn in candidates:
+                ov = _interval_overlap(paf_start, paf_end, s, e)
+                if ov <= 0:
+                    continue
+                mrna_len = e - s + 1
+                frac = ov / max(1, min(paf_len, mrna_len))
+                if (frac, ov) > best:
+                    best = (frac, ov)
+                    best_fid = fid
+            if best_fid is not None and best[0] >= overlap_thresh:
+                chosen = best_fid
+
+        mrna_ids.append(chosen)
+
+    winners['mrna_id'] = mrna_ids
+    n_matched = sum(x is not None for x in mrna_ids)
+    logger.info(
+        'Linked %d/%d winners to existing mRNA features.', n_matched, len(winners)
     )
+    return winners
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
+# ---------------------------------------------------------------------------
+# TSV output
+# ---------------------------------------------------------------------------
+
+
+def build_tsv(
+    winners: pd.DataFrame,
+    cds_by_parent: dict[str, list[GffFeature]],
+) -> pd.DataFrame:
     """
-    Build the command-line interface parser.
+    Build the TSV summary table (one row per emitted candidate).
+
+    Parameters
+    ----------
+    winners : pandas.DataFrame
+        Winner rows with metric columns and ``mrna_id``.
+    cds_by_parent : dict of str to list of GffFeature
+        Input CDS features grouped by Parent (for ``gff_cds_nt_len``).
+
+    Returns
+    -------
+    pandas.DataFrame
+        Table with :data:`TSV_COLUMNS`, floats rounded to 4 decimal places
+        and missing values rendered as ``NA``.
     """
-    ap = argparse.ArgumentParser(
-        description=(
-            'Pick best miniprot alignments per locus from a GFF3 (with ##PAF headers). '
-            f'Version {__version__}'
+    df = winners.copy()
+    df['tstart'] = df['ts'].astype(int) + 1
+    df['tend'] = df['te'].astype(int)
+    df['status'] = df['intact'].map({True: 'intact', False: 'pseudogene'})
+    df['fs'] = _tag_series(df, 'fs')
+    df['st'] = _tag_series(df, 'st')
+    for col in ('ms', 'AS'):
+        if col not in df.columns:
+            df[col] = pd.NA
+    df['gff_cds_nt_len'] = df['mrna_id'].map(
+        lambda mid: (
+            sum(p.end - p.start + 1 for p in cds_by_parent.get(mid, []))
+            if pd.notna(mid) and mid in cds_by_parent
+            else pd.NA
         )
     )
+    for col in ('cov_aa', 'pid_aa', 'positives', 'score_raw'):
+        df[col] = pd.to_numeric(df[col], errors='coerce').round(4)
+    return df.reindex(columns=list(TSV_COLUMNS))
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def add_arguments(ap: argparse.ArgumentParser) -> None:
+    """
+    Add ``maxiprot filter`` arguments to a parser.
+
+    Parameters
+    ----------
+    ap : argparse.ArgumentParser
+        Parser (top-level subparser or standalone) to populate.
+    """
     ap.add_argument(
         'gff',
         nargs='?',
         default='-',
-        help="miniprot GFF3 path or '-' for stdin (default: '-')",
+        help="Miniprot GFF3 with ##PAF lines (path or '-' for stdin).",
+    )
+
+    # Gating
+    ap.add_argument(
+        '--min-cov',
+        type=float,
+        default=0.60,
+        help='Minimum reference coverage (fraction, 0-1).',
+    )
+    ap.add_argument(
+        '--min-pid',
+        type=float,
+        default=0.30,
+        help='Minimum AA identity (fraction, 0-1).',
+    )
+    ap.add_argument(
+        '--strict',
+        action='store_true',
+        help='Drop a locus entirely if no candidate passes gates.',
     )
 
     # Scoring
     ap.add_argument(
         '--score-mode',
-        choices=[
-            'ms_cov_pos',
-            'AS',
-            'ms',
-            'pid_cov',
-            'pid_cov_len',
-            'length',
-            'linear',
-            'geom',
-        ],
+        choices=sorted(SCORE_MODES),
         default='ms_cov_pos',
-        help='Scoring function to rank candidates (default: ms_cov_pos)',
+        help='How candidates are ranked within a locus.',
     )
     ap.add_argument(
         '--length-metric',
         choices=['frac', 'aa'],
         default='frac',
-        help="Use 'frac' (aa_len/qlen) or 'aa' (absolute aa length) when a score uses length (default: frac)",
+        help=(
+            "Length ingredient: 'frac' = aligned AA / reference length; "
+            "'aa' = absolute aligned AA length."
+        ),
+    )
+    ap.add_argument('--w-pid', type=float, default=1.0, help='Weight for identity.')
+    ap.add_argument('--w-cov', type=float, default=1.0, help='Weight for coverage.')
+    ap.add_argument(
+        '--w-len', type=float, default=1.0, help='Weight for the length metric.'
     )
     ap.add_argument(
-        '--w-pid',
-        type=float,
-        default=1.0,
-        help='Weight/exponent for identity where relevant (default: 1.0)',
+        '--w-pos', type=float, default=0.0, help='Weight for positives (linear/geom).'
     )
     ap.add_argument(
-        '--w-cov',
-        type=float,
-        default=1.0,
-        help='Weight/exponent for coverage where relevant (default: 1.0)',
+        '--w-ms', type=float, default=0.0, help='Weight for ms/qlen (linear/geom).'
     )
     ap.add_argument(
-        '--w-len',
-        type=float,
-        default=1.0,
-        help='Weight/exponent for length where relevant (default: 1.0)',
-    )
-    ap.add_argument(
-        '--w-pos',
-        type=float,
-        default=0.0,
-        help='Weight for positives in linear/geom modes (default: 0.0)',
-    )
-    ap.add_argument(
-        '--w-ms',
-        type=float,
-        default=0.0,
-        help='Weight for ms_per_qlen in linear/geom modes (default: 0.0)',
-    )
-    ap.add_argument(
-        '--w-AS',
-        type=float,
-        default=0.0,
-        help='Weight for AS_per_qlen in linear/geom modes (default: 0.0)',
-    )
-
-    # Gates
-    ap.add_argument(
-        '--min-cov',
-        type=float,
-        default=0.60,
-        help='Minimum AA coverage of query to pass (default: 0.60)',
-    )
-    ap.add_argument(
-        '--min-pid',
-        type=float,
-        default=0.80,
-        help='Minimum AA identity to pass (default: 0.30)',
-    )
-    ap.add_argument(
-        '--strict',
-        action='store_true',
-        help='Drop loci with no passing candidates (default: pick best anyway)',
-    )
-
-    # Locus clustering
-    ap.add_argument(
-        '--locus-pad',
-        dest='locus_pad',
-        type=int,
-        default=5000,
-        help='Max gap (nt) to cluster non-overlapping hits to the same locus on the same strand (default: 5000)',
-    )
-    ap.add_argument(
-        '--locus-gap', dest='locus_pad', type=int, help='Alias for --locus-pad'
+        '--w-AS', type=float, default=0.0, help='Weight for AS/qlen (linear/geom).'
     )
 
     # Selection policy
@@ -677,244 +563,198 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=['best', 'prefer_intact', 'longest', 'longest_prefer_intact'],
         default='best',
         help=(
-            'How to choose the winner within a locus:\n'
-            '  best: highest score (gated first)\n'
-            '  prefer_intact: best among intact if available; else best overall\n'
-            '  longest: longest AA length; tie-break by score\n'
-            '  longest_prefer_intact: longest among intact; else longest overall'
+            'How to choose a single winner per locus: '
+            "'best' by score; 'prefer_intact' picks best among intact if any; "
+            "'longest' picks maximum AA length; "
+            "'longest_prefer_intact' prefers intact among the longest."
         ),
+    )
+
+    # Emission policy
+    ap.add_argument(
+        '--emit-mode',
+        choices=['best', 'all_passing'],
+        default='best',
+        help=(
+            "'best' emits a single winner per locus; 'all_passing' emits all "
+            'candidates that pass gates in each locus.'
+        ),
+    )
+    ap.add_argument(
+        '--max-per-locus',
+        type=int,
+        default=None,
+        help='With --emit-mode=all_passing, cap emitted candidates per locus.',
+    )
+
+    # Locus clustering
+    ap.add_argument(
+        '--locus-pad',
+        '--locus-gap',
+        dest='locus_pad',
+        type=int,
+        default=5000,
+        help='Max gap (nt) joining hits on the same target/strand into one locus.',
     )
 
     # Output / misc
     ap.add_argument(
-        '--id-prefix',
-        default='PBM',
-        help='Prefix for synthesized Gene/CDS IDs (default: PBM)',
-    )
-    ap.add_argument(
         '--out-gff3',
+        metavar='FILE',
         default='-',
-        help="Output GFF3 path (default: '-' = stdout)",
+        help="Write GFF3 to FILE, or '-' for stdout.",
     )
     ap.add_argument(
         '--out-tsv',
+        metavar='FILE',
         default=None,
-        help="Output TSV path (default: write TSV to stderr). Use '-' to also force stderr.",
+        help="Write TSV summary to FILE ('-' = stdout). Not written by default.",
     )
     ap.add_argument(
-        '--log-level',
-        default='INFO',
-        help='Logging level (DEBUG, INFO, WARNING, ERROR; default: INFO)',
+        '--id-prefix', default='PBM', help='Prefix for synthesized GFF3 IDs.'
     )
+    ap.add_argument(
+        '--log-level', default='INFO', choices=LOG_LEVELS, help='Logging level.'
+    )
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """
+    Build the standalone ``maxiprot filter`` parser.
+
+    Returns
+    -------
+    argparse.ArgumentParser
+        A configured argument parser instance.
+    """
+    ap = argparse.ArgumentParser(
+        prog='maxiprot filter',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description='Pick the best (or all passing) miniprot alignments per locus.',
+    )
+    add_arguments(ap)
     return ap
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def run(args: argparse.Namespace) -> int:
     """
-    CLI entrypoint.
+    Run the filter pipeline for parsed arguments.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed CLI arguments (see :func:`add_arguments`).
 
     Returns
     -------
     int
-        Exit status code.
+        Exit status: 0 success, 2 usage/input error.
     """
-    ap = build_arg_parser()
-    args = ap.parse_args(argv)
+    init_logging(loglevel=args.log_level)
 
-    configure_logging(args.log_level)
-    logging.info('maxiprot version %s', __version__)
-    logging.info('Reading input: %s', args.gff)
-
-    lines = read_lines(args.gff)
-
-    logging.info('Parsing PAF headers (##PAF lines)')
-    paf = read_paf_from_gff_lines(lines)
-    logging.info('Found %d candidate alignments in PAF', len(paf))
-
-    logging.info('Parsing GFF features (mRNA/CDS)')
-    mdf, cdf = read_gff_features(lines)
-    logging.info('GFF mRNAs: %d; CDS parts: %d', len(mdf), len(cdf))
-
-    logging.info('Computing alignment metrics and gates')
-    paf = add_alignment_metrics(paf)
-    paf['score_raw'] = paf.apply(
-        lambda r: score_alignment(r, args.score_mode, args), axis=1
-    )
-    paf['passes'] = (paf['cov_aa'] >= args.min_cov) & (paf['pid_aa'] >= args.min_pid)
-
-    logging.info(
-        'Clustering into loci with pad=%d nt (same seq & strand)', args.locus_pad
-    )
-    paf = cluster_into_loci(paf, pad_nt=args.locus_pad)
-
-    # Selection per locus
-    winners_rows: List[pd.Series] = []
-    logging.info(
-        'Selection mode: %s | score-mode: %s | gates: cov>=%.2f pid>=%.2f',
-        args.selection_mode,
-        args.score_mode,
-        args.min_cov,
-        args.min_pid,
-    )
-    if args.score_mode in ('pid_cov_len', 'linear', 'geom'):
-        logging.info(
-            'Weights: w_pid=%.3f w_cov=%.3f w_len=%.3f w_pos=%.3f w_ms=%.3f w_AS=%.3f | length-metric=%s',
-            args.w_pid,
-            args.w_cov,
-            args.w_len,
-            args.w_pos,
-            args.w_ms,
-            args.w_AS,
-            args.length_metric,
+    for name, value in (('--min-cov', args.min_cov), ('--min-pid', args.min_pid)):
+        if not 0.0 <= value <= 1.0:
+            logger.error('%s must be a fraction in [0, 1]; got %s', name, value)
+            return 2
+    gff3_to_stdout = args.out_gff3 in (None, '-', '')
+    if gff3_to_stdout and args.out_tsv == '-':
+        logger.error(
+            'GFF3 and TSV cannot both go to stdout; give --out-gff3 or '
+            '--out-tsv a file path.'
         )
+        return 2
 
-    for locus, sub in paf.groupby('locus', sort=False):
-        num = len(sub)
-        logging.info('[Locus %s] %d candidates', locus, num)
-
-        # Sort: passers first, then by score, then by length (as tie-break)
-        sub = sub.copy().sort_values(
-            ['passes', 'score_raw', 'cds_aa_len'], ascending=[False, False, False]
-        )
-
-        # Per-candidate log
-        for _, r in sub.iterrows():
-            status = (
-                'pseudogene' if (int(r['fs']) > 0 or int(r['st']) > 0) else 'intact'
-            )
-            logging.info(
-                '[Locus %s] cand q=%s score=%.5f cov=%.3f pid=%.3f lenAA=%d pos=%.3f ms=%d AS=%d fs=%d st=%d pass=%s status=%s',
-                locus,
-                r['qname'],
-                float(r['score_raw']),
-                float(r['cov_aa']),
-                float(r['pid_aa']),
-                int(r['cds_aa_len']),
-                float(r['positives']),
-                int(r['ms']),
-                int(r['AS']),
-                int(r['fs']),
-                int(r['st']),
-                bool(r['passes']),
-                status,
-            )
-
-        # Optional strict drop of non-pass loci
-        if args.strict and not bool(sub['passes'].any()):
-            logging.warning(
-                '[Locus %s] no candidates pass gates -> skipped due to --strict', locus
-            )
-            continue
-
-        # Selection policy
-        def choose(df: pd.DataFrame) -> pd.Series:
-            if args.selection_mode in ('longest', 'longest_prefer_intact'):
-                return df.sort_values(
-                    ['passes', 'cds_aa_len', 'score_raw'],
-                    ascending=[False, False, False],
-                ).iloc[0]
-            return df.iloc[0]
-
-        working = sub
-        if args.selection_mode in ('prefer_intact', 'longest_prefer_intact'):
-            intact = sub[(sub['fs'] == 0) & (sub['st'] == 0)]
-            if not intact.empty:
-                logging.info(
-                    '[Locus %s] intact candidates available: %d -> prefer intact',
-                    locus,
-                    len(intact),
-                )
-                working = intact
-            else:
-                logging.info(
-                    '[Locus %s] no intact candidates -> fallback to all', locus
-                )
-
-        pick = choose(working)
-        logging.info(
-            '[Locus %s] SELECTED q=%s (score=%.5f, cov=%.3f, pid=%.3f, lenAA=%d, fs=%d, st=%d)',
-            locus,
-            pick['qname'],
-            float(pick['score_raw']),
-            float(pick['cov_aa']),
-            float(pick['pid_aa']),
-            int(pick['cds_aa_len']),
-            int(pick['fs']),
-            int(pick['st']),
-        )
-        winners_rows.append(pick)
-
-    if not winners_rows:
-        logging.warning('No winners selected. Exiting.')
-        return 0
-
-    winners = pd.DataFrame(winners_rows)
-    winners = winners.assign(
-        status=winners.apply(
-            lambda r: (
-                'pseudogene' if (int(r['fs']) > 0 or int(r['st']) > 0) else 'intact'
-            ),
-            axis=1,
-        )
-    )
-
-    # Map back to GFF features for chosen winners
-    winners = attach_mrna_and_cds_length(winners, mdf, cdf)
-
-    # Write TSV (file if given; else stderr)
-    tsv_cols = [
-        'locus',
-        'tname',
-        'tstart',
-        'tend',
-        'strand',
-        'qname',
-        'qlen',
-        'cov_aa',
-        'pid_aa',
-        'positives',
-        'ms',
-        'AS',
-        'score_raw',
-        'cds_aa_len',
-        'fs',
-        'st',
-        'status',
-        'passes',
-        'mapq',
-        'mrna_id',
-        'gff_cds_nt_len',
-    ]
-
-    if args.out_tsv and args.out_tsv != '-':
-        winners[tsv_cols].to_csv(args.out_tsv, sep='\t', index=False)
-        logging.info('Wrote TSV summary: %s', args.out_tsv)
+    if args.gff in (None, '-', ''):
+        logger.info('Reading GFF3 from stdin...')
     else:
-        # Pure TSV to stderr (logs may interleave; consider --log-level ERROR or redirect)
-        winners[tsv_cols].to_csv(sys.stderr, sep='\t', index=False)
-        logging.info('Wrote TSV summary to stderr')
+        logger.info('Reading GFF3: %s', args.gff)
+    try:
+        paf, mrna_by_id, cds_by_parent = load_input(args.gff)
+    except OSError as e:
+        logger.error('Cannot read input: %s', e)
+        return 2
+    if paf.empty:
+        logger.error('No PAF (##PAF) records were found; cannot proceed.')
+        return 2
 
-    # Write GFF3 (stdout by default)
-    write_best_gff3(args.out_gff3, winners, mdf, cdf, id_prefix=args.id_prefix)
-    if args.out_gff3 and args.out_gff3 != '-':
-        logging.info('Wrote best-per-locus GFF3: %s', args.out_gff3)
-    else:
-        logging.info('Wrote best-per-locus GFF3 to stdout')
+    paf = compute_alignment_metrics(paf)
+    weights = Weights(
+        pid=args.w_pid,
+        cov=args.w_cov,
+        len=args.w_len,
+        pos=args.w_pos,
+        ms=args.w_ms,
+        AS=args.w_AS,
+    )
+    try:
+        paf['score_raw'] = compute_scores(
+            paf, args.score_mode, weights, args.length_metric
+        )
+    except ValueError as e:
+        logger.error(str(e))
+        return 2
+
+    paf['passes'] = apply_gates(paf, args.min_cov, args.min_pid)
+    paf['intact'] = gate_intact_v_pseudo(paf)
+    paf = cluster_into_loci(paf, locus_pad=args.locus_pad)
+
+    winners = select_per_locus(
+        paf,
+        selection_mode=args.selection_mode,
+        emit_mode=args.emit_mode,
+        max_per_locus=args.max_per_locus,
+        strict=args.strict,
+    )
+    if winners.empty:
+        logger.warning('No winners selected.')
+
+    winners = attach_mrna_ids_to_winners(winners, mrna_by_id, cds_by_parent)
+
+    tlens = (
+        dict(zip(paf['tname'].astype(str), paf['tlen'].astype(int)))
+        if not paf.empty
+        else {}
+    )
+    write_best_gff3(
+        args.out_gff3,
+        winners,
+        mrna_by_id,
+        cds_by_parent,
+        id_prefix=args.id_prefix,
+        tlens=tlens,
+    )
+
+    if args.out_tsv is not None:
+        tsv_df = build_tsv(winners, cds_by_parent)
+        out, close_me = open_output(args.out_tsv)
+        try:
+            tsv_df.to_csv(out, sep='\t', index=False, na_rep='NA')
+        finally:
+            if close_me:
+                out.close()
+        if args.out_tsv != '-':
+            logger.info('Wrote TSV summary to file: %s', args.out_tsv)
 
     return 0
 
 
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """
+    Run the ``maxiprot filter`` command-line interface.
+
+    Parameters
+    ----------
+    argv : Sequence[str] or None, optional
+        Argument vector to parse instead of ``sys.argv``. Useful for testing.
+
+    Returns
+    -------
+    int
+        Exit status code (0 on success).
+    """
+    args = build_arg_parser().parse_args(argv)
+    return run(args)
+
+
 if __name__ == '__main__':
-    try:
-        raise SystemExit(main())
-    except BrokenPipeError:
-        # allow piping into head/tail without noisy tracebacks
-        try:
-            sys.stderr.close()
-        except Exception:
-            pass
-        try:
-            sys.stdout.close()
-        except Exception:
-            pass
-        raise
+    raise SystemExit(guard_broken_pipe(main))

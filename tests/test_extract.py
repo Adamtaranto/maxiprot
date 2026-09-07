@@ -228,3 +228,127 @@ def test_fai_created_if_missing(genome_plus, gff_plus_two_exons, capsys):
         capsys,
     )
     assert rc == 0 and fai.exists()
+
+
+def test_cds_before_mrna_order_keeps_all_parts(
+    genome_plus, gff_plus_cds_before_mrna, capsys
+):
+    """CDS lines preceding their mRNA line must not lose collected parts."""
+    rc, stdout, _ = run_extract_and_capture(
+        [
+            str(gff_plus_cds_before_mrna),
+            '-g',
+            str(genome_plus),
+            '--extract',
+            'cds',
+            '--log-level',
+            'ERROR',
+        ],
+        capsys,
+    )
+    assert rc == 0
+    recs = parse_fasta(stdout)
+    assert next(iter(recs.values())) == 'ATGAAATTT'
+
+
+def test_reverse_complement_preserves_iupac():
+    from maxiprot.extract import reverse_complement
+
+    assert reverse_complement('ACGTRYN') == 'NRYACGT'
+
+
+def test_transl_table_4_TGA_is_tryptophan():
+    from maxiprot.extract import translate_nt
+
+    assert translate_nt('ATGTGA', 4) == 'MW'
+    assert translate_nt('ATGTGA', 1) == 'M*'
+
+
+def test_transl_table_11_is_supported():
+    from maxiprot.extract import translate_nt
+
+    assert translate_nt('ATGAAA', 11) == 'MK'
+
+
+def test_unsupported_transl_table_rejected_by_argparse(
+    genome_plus, gff_plus_two_exons, capsys
+):
+    import pytest
+
+    with pytest.raises(SystemExit) as exc:
+        extract_mod.main(
+            [
+                str(gff_plus_two_exons),
+                '-g',
+                str(genome_plus),
+                '--transl-table',
+                '99',
+            ]
+        )
+    assert exc.value.code == 2
+
+
+def test_missing_contig_returns_1(genome_plus, tmp_path, capsys, caplog):
+    caplog.set_level('ERROR')
+    gff = tmp_path / 'badcontig.gff3'
+    gff.write_text(
+        '##gff-version 3\n'
+        'chrMISSING\tmaxiprot\tmRNA\t1\t9\t.\t+\t.\tID=txX\n'
+        'chrMISSING\tmaxiprot\tCDS\t1\t9\t.\t+\t0\tParent=txX\n',
+        encoding='utf-8',
+    )
+    rc, stdout, _ = run_extract_and_capture(
+        [
+            str(gff),
+            '-g',
+            str(genome_plus),
+            '--extract',
+            'protein',
+            '--log-level',
+            'ERROR',
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert parse_fasta(stdout) == {}
+    assert any('not found in genome FASTA' in rec.message for rec in caplog.records)
+
+
+def test_phase_mismatch_on_downstream_part_warns(genome_plus, tmp_path, capsys, caplog):
+    """A downstream CDS phase disagreeing with cumulative length warns."""
+    caplog.set_level('WARNING')
+    gff = tmp_path / 'frameshift.gff3'
+    # Parts of length 3 and 3: expected phase of second part is 0, not 2.
+    gff.write_text(
+        '##gff-version 3\n'
+        'chrA\tmaxiprot\tmRNA\t101\t203\t.\t+\t.\tID=txF\n'
+        'chrA\tmaxiprot\tCDS\t101\t103\t.\t+\t0\tParent=txF\n'
+        'chrA\tmaxiprot\tCDS\t201\t203\t.\t+\t2\tParent=txF\n',
+        encoding='utf-8',
+    )
+    rc, _, _ = run_extract_and_capture(
+        [
+            str(gff),
+            '-g',
+            str(genome_plus),
+            '--extract',
+            'cds',
+            '--log-level',
+            'WARNING',
+        ],
+        capsys,
+    )
+    assert rc == 0
+    assert any('frameshifted' in rec.message for rec in caplog.records)
+
+
+def test_fasta_wrap_width():
+    import io as _io
+
+    from maxiprot.extract import write_fasta
+
+    buf = _io.StringIO()
+    write_fasta([('long', 'A' * 130)], buf)
+    lines = buf.getvalue().splitlines()
+    assert lines[0] == '>long'
+    assert [len(x) for x in lines[1:]] == [60, 60, 10]

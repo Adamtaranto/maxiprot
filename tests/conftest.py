@@ -2,103 +2,392 @@ from __future__ import annotations
 
 from pathlib import Path
 import textwrap
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 import pytest
 
+# -----------------------------
+# Builders for miniprot-shaped GFF3 fixtures
+# -----------------------------
 
-@pytest.fixture
-def gff_minimal_two_loci(tmp_path):
+
+def make_cs(identical: int, substituted: int = 0) -> str:
+    """Build a miniprot-style cs:Z string with the given composition."""
+    cs = f':{identical}' if identical else ''
+    cs += '*aa' * substituted
+    return cs
+
+
+def paf_line(
+    qname: str,
+    qlen: int,
+    qs: int,
+    qe: int,
+    strand: str,
+    tname: str,
+    tlen: int,
+    ts: int,
+    te: int,
+    nmatch: int,
+    alen: int,
+    mapq: int = 60,
+    tags: Dict[str, int | str] | None = None,
+) -> str:
+    """Build a ##PAF header line as miniprot emits it."""
+    base = [
+        qname,
+        str(qlen),
+        str(qs),
+        str(qe),
+        strand,
+        tname,
+        str(tlen),
+        str(ts),
+        str(te),
+        str(nmatch),
+        str(alen),
+        str(mapq),
+    ]
+    tags = tags or {}
+    ex = []
+    for k, v in tags.items():
+        ex.append(f'{k}:i:{v}' if isinstance(v, int) else f'{k}:Z:{v}')
+    return '##PAF\t' + '\t'.join(base + ex)
+
+
+def gff_feat(
+    seqid: str,
+    source: str,
+    ftype: str,
+    start: int,
+    end: int,
+    strand: str,
+    phase: int | str = '.',
+    attrs: Dict[str, str] | None = None,
+    score: str = '.',
+) -> str:
+    """Build a single 9-column GFF3 feature line."""
+    attrs = attrs or {}
+    attr_txt = ';'.join([f'{k}={v}' for k, v in attrs.items()])
+    return '\t'.join(
+        map(str, [seqid, source, ftype, start, end, score, strand, phase, attr_txt])
+    )
+
+
+def wrap_gff(paf_lines: Iterable[str], feats: Iterable[str]) -> str:
+    """Assemble PAF headers and feature lines into a GFF3 document."""
+    lines = ['##gff-version 3']
+    lines.extend(paf_lines)
+    lines.extend(feats)
+    return '\n'.join(lines) + '\n'
+
+
+# -----------------------------
+# GFF3 validity checker (shared by emission tests)
+# -----------------------------
+
+
+def assert_valid_gff3(text: str) -> None:
+    """Assert structural GFF3 validity of maxiprot filter output.
+
+    Checks: gff-version header; 1-based start<=end; unique gene/mRNA IDs;
+    every Parent resolves to an earlier feature; all CDS parts of one mRNA
+    share exactly one ID; features are coordinate-sorted by (seqid, gene
+    start) at the gene level.
     """
-    Minimal synthetic miniprot-like GFF3 with two loci on chr1.
+    lines = text.splitlines()
+    assert lines and lines[0] == '##gff-version 3'
 
-    Locus A (100k..~102k):
-      - RefPseudo (higher AS, but fs=1, st=1)
-      - RefGood   (lower AS, intact: fs=0, st=0)
-    Locus B (200k..~201k):
-      - RefFar (intact)
-
-    These are crafted so:
-      * Default 'best' by AS picks RefPseudo for locus A.
-      * '--selection-mode prefer_intact' picks RefGood for locus A.
-      * Locus B always picks RefFar.
-    """
-    gff = textwrap.dedent("""\
-        ##gff-version 3
-        ##PAF\tRefPseudo\t600\t0\t600\t+\tchr1\t1000000\t100200\t101900\t900\t1800\t0\tAS:i:1600\tms:i:1600\tnp:i:500\tfs:i:1\tst:i:1\tda:i:0\tdo:i:0\tcg:Z:100M\tcs:Z::100
-        chr1\tminiprot\tmRNA\t100201\t101900\t1600\t+\t.\tID=MP_pseudo;Target=RefPseudo 1 600
-        chr1\tminiprot\tCDS\t100201\t100600\t.\t+\t0\tParent=MP_pseudo;ID=CDS_pseudo
-        chr1\tminiprot\tCDS\t101300\t101900\t.\t+\t0\tParent=MP_pseudo;ID=CDS_pseudo
-        ##PAF\tRefGood\t600\t0\t600\t+\tchr1\t1000000\t100000\t101800\t900\t1800\t0\tAS:i:1400\tms:i:1400\tnp:i:500\tfs:i:0\tst:i:0\tda:i:0\tdo:i:0\tcg:Z:100M\tcs:Z::100
-        chr1\tminiprot\tmRNA\t100001\t101800\t1400\t+\t.\tID=MP_good;Target=RefGood 1 600
-        chr1\tminiprot\tCDS\t100001\t100500\t.\t+\t0\tParent=MP_good;ID=CDS_good
-        chr1\tminiprot\tCDS\t101300\t101800\t.\t+\t0\tParent=MP_good;ID=CDS_good
-        ##PAF\tRefFar\t600\t0\t600\t+\tchr1\t1000000\t200000\t201000\t900\t1800\t0\tAS:i:1000\tms:i:1000\tnp:i:400\tfs:i:0\tst:i:0\tda:i:0\tdo:i:0\tcg:Z:100M\tcs:Z::100
-        chr1\tminiprot\tmRNA\t200001\t201000\t1000\t+\t.\tID=MP_far;Target=RefFar 1 600
-        chr1\tminiprot\tCDS\t200001\t200400\t.\t+\t0\tParent=MP_far;ID=CDS_far
-        chr1\tminiprot\tCDS\t200600\t201000\t.\t+\t0\tParent=MP_far;ID=CDS_far
-    """)
-    p = tmp_path / 'two_loci.gff3'
-    p.write_text(gff, encoding='utf-8')
-    return p
-
-
-@pytest.fixture
-def gff_all_fail_gating(tmp_path):
-    """
-    One locus where coverage should be < min-cov gate if set high.
-
-    qlen=600, qstart=0, qend=300 => cov=0.5, so --min-cov 0.9 will drop it.
-    """
-    gff = """##gff-version 3
-##PAF\tLowCov\t600\t0\t300\t+\tchr2\t500000\t5000\t8000\t300\t1000\t0\tAS:i:500\tms:i:500\tnp:i:200\tfs:i:0\tst:i:0\tda:i:0\tdo:i:0\tcg:Z:100M\tcs:Z::100
-chr2\tminiprot\tmRNA\t5001\t8000\t500\t+\t.\tID=MP_low;Target=LowCov 1 300
-chr2\tminiprot\tCDS\t5001\t6000\t.\t+\t0\tParent=MP_low;ID=CDS_low
-chr2\tminiprot\tCDS\t7000\t8000\t.\t+\t0\tParent=MP_low;ID=CDS_low
-"""
-    p = tmp_path / 'lowcov.gff3'
-    p.write_text(gff, encoding='utf-8')
-    return p
-
-
-def parse_gff_attrs(attr_field: str) -> Dict[str, str]:
-    d: Dict[str, str] = {}
-    for kv in attr_field.split(';'):
-        if '=' in kv:
-            k, v = kv.split('=', 1)
-            d[k] = v
-    return d
-
-
-def split_gff_lines(
-    gff_text: str,
-) -> List[Tuple[str, str, str, int, int, str, str, str, Dict[str, str]]]:
-    """
-    Return parsed GFF tuples for non-comment lines:
-      (seqid, source, ftype, start, end, score, strand, phase, attrs_dict)
-    """
-    lines = []
-    for ln in gff_text.splitlines():
+    seen_ids: Dict[str, str] = {}  # ID -> ftype
+    cds_ids_by_parent: Dict[str, set] = {}
+    gene_order: List[Tuple[str, int]] = []
+    for ln in lines[1:]:
         if not ln or ln.startswith('#'):
             continue
-        cols = ln.rstrip('\n').split('\t')
-        if len(cols) < 9:
-            continue
-        seqid, source, ftype, start_s, end_s, score, strand, phase, attrs = cols[:9]
-        lines.append(
-            (
-                seqid,
-                source,
-                ftype,
-                int(start_s),
-                int(end_s),
-                score,
-                strand,
-                phase,
-                parse_gff_attrs(attrs),
-            )
+        cols = ln.split('\t')
+        assert len(cols) == 9, f'Bad column count: {ln!r}'
+        seqid, _source, ftype, start_s, end_s, _score, strand, _phase, attrs_s = cols
+        start, end = int(start_s), int(end_s)
+        assert 1 <= start <= end, f'Bad coordinates: {ln!r}'
+        assert strand in {'+', '-', '.', '?'}
+        attrs = dict(x.split('=', 1) for x in attrs_s.split(';') if '=' in x)
+        fid = attrs.get('ID')
+        parent = attrs.get('Parent')
+        if parent is not None:
+            assert parent in seen_ids, f'Unresolved Parent {parent!r} in: {ln!r}'
+        if ftype in {'gene', 'mRNA'}:
+            assert fid, f'{ftype} without ID: {ln!r}'
+            assert fid not in seen_ids, f'Duplicate {ftype} ID {fid!r}'
+            seen_ids[fid] = ftype
+            if ftype == 'gene':
+                gene_order.append((seqid, start))
+        elif ftype == 'CDS':
+            assert fid, f'CDS without ID: {ln!r}'
+            assert parent, f'CDS without Parent: {ln!r}'
+            cds_ids_by_parent.setdefault(parent, set()).add(fid)
+            seen_ids.setdefault(fid, 'CDS')
+
+    for parent, ids in cds_ids_by_parent.items():
+        assert len(ids) == 1, (
+            f'CDS parts of {parent!r} carry {len(ids)} distinct IDs: {ids}'
         )
-    return lines
+    assert gene_order == sorted(gene_order), 'genes are not coordinate-sorted'
+
+
+# -----------------------------
+# Filter fixtures (miniprot-shaped: CDS lines carry NO ID attribute)
+# -----------------------------
+
+
+@pytest.fixture
+def gff_minimal_two_loci(tmp_path: Path) -> Path:
+    """Two loci on chr1(+).
+
+    Locus A: RefPseudo (higher ms/AS but fs=1,st=1) vs RefGood (intact,
+    higher pid). Locus B: RefFar (intact), 100 kb away.
+
+    Default ms_cov_pos scoring picks RefPseudo at locus A;
+    --selection-mode prefer_intact picks RefGood; pid_cov picks RefGood.
+    """
+    pafs = [
+        paf_line(
+            'RefPseudo',
+            600,
+            0,
+            600,
+            '+',
+            'chr1',
+            1_000_000,
+            100200,
+            101900,
+            420,
+            600,
+            tags={
+                'AS': 1600,
+                'ms': 1500,
+                'np': 520,
+                'fs': 1,
+                'st': 1,
+                'cs': make_cs(420, 180),
+            },
+        ),
+        paf_line(
+            'RefGood',
+            600,
+            0,
+            600,
+            '+',
+            'chr1',
+            1_000_000,
+            100000,
+            101800,
+            440,
+            600,
+            tags={
+                'AS': 1400,
+                'ms': 1400,
+                'np': 500,
+                'fs': 0,
+                'st': 0,
+                'cs': make_cs(440, 160),
+            },
+        ),
+        paf_line(
+            'RefFar',
+            600,
+            0,
+            600,
+            '+',
+            'chr1',
+            1_000_000,
+            200000,
+            201000,
+            430,
+            600,
+            tags={
+                'AS': 1500,
+                'ms': 1450,
+                'np': 510,
+                'fs': 0,
+                'st': 0,
+                'cs': make_cs(430, 170),
+            },
+        ),
+    ]
+    feats = [
+        gff_feat(
+            'chr1',
+            'miniprot',
+            'mRNA',
+            100201,
+            101900,
+            '+',
+            '.',
+            {'ID': 'MP_pseudo', 'Target': 'RefPseudo 1 600'},
+        ),
+        gff_feat(
+            'chr1',
+            'miniprot',
+            'CDS',
+            100201,
+            100600,
+            '+',
+            '0',
+            {'Parent': 'MP_pseudo', 'Target': 'RefPseudo 1 133'},
+        ),
+        gff_feat(
+            'chr1',
+            'miniprot',
+            'CDS',
+            101300,
+            101900,
+            '+',
+            '0',
+            {'Parent': 'MP_pseudo', 'Target': 'RefPseudo 134 600'},
+        ),
+        gff_feat(
+            'chr1',
+            'miniprot',
+            'mRNA',
+            100001,
+            101800,
+            '+',
+            '.',
+            {'ID': 'MP_good', 'Target': 'RefGood 1 600'},
+        ),
+        gff_feat(
+            'chr1',
+            'miniprot',
+            'CDS',
+            100001,
+            100500,
+            '+',
+            '0',
+            {'Parent': 'MP_good', 'Target': 'RefGood 1 167'},
+        ),
+        gff_feat(
+            'chr1',
+            'miniprot',
+            'CDS',
+            101300,
+            101800,
+            '+',
+            '0',
+            {'Parent': 'MP_good', 'Target': 'RefGood 168 600'},
+        ),
+        gff_feat(
+            'chr1',
+            'miniprot',
+            'mRNA',
+            200001,
+            201000,
+            '+',
+            '.',
+            {'ID': 'MP_far', 'Target': 'RefFar 1 600'},
+        ),
+        gff_feat(
+            'chr1',
+            'miniprot',
+            'CDS',
+            200001,
+            200400,
+            '+',
+            '0',
+            {'Parent': 'MP_far', 'Target': 'RefFar 1 133'},
+        ),
+        gff_feat(
+            'chr1',
+            'miniprot',
+            'CDS',
+            200600,
+            201000,
+            '+',
+            '0',
+            {'Parent': 'MP_far', 'Target': 'RefFar 134 600'},
+        ),
+    ]
+    p = tmp_path / 'two_loci.gff3'
+    p.write_text(wrap_gff(pafs, feats), encoding='utf-8')
+    return p
+
+
+@pytest.fixture
+def gff_all_fail_gating(tmp_path: Path) -> Path:
+    """One locus whose only candidate has cov=0.5 (fails --min-cov 0.9)."""
+    pafs = [
+        paf_line(
+            'LowCov',
+            600,
+            0,
+            300,
+            '+',
+            'chr2',
+            500_000,
+            5000,
+            8000,
+            150,
+            300,
+            tags={
+                'AS': 500,
+                'ms': 450,
+                'np': 200,
+                'fs': 0,
+                'st': 0,
+                'cs': make_cs(150, 150),
+            },
+        )
+    ]
+    feats = [
+        gff_feat(
+            'chr2',
+            'miniprot',
+            'mRNA',
+            5001,
+            8000,
+            '+',
+            '.',
+            {'ID': 'MP_low', 'Target': 'LowCov 1 300'},
+        ),
+        gff_feat(
+            'chr2',
+            'miniprot',
+            'CDS',
+            5001,
+            6000,
+            '+',
+            '0',
+            {'Parent': 'MP_low', 'Target': 'LowCov 1 150'},
+        ),
+        gff_feat(
+            'chr2',
+            'miniprot',
+            'CDS',
+            7000,
+            8000,
+            '+',
+            '0',
+            {'Parent': 'MP_low', 'Target': 'LowCov 151 300'},
+        ),
+    ]
+    p = tmp_path / 'all_fail.gff3'
+    p.write_text(wrap_gff(pafs, feats), encoding='utf-8')
+    return p
+
+
+# -----------------------------
+# utilities for FASTA generation
+# -----------------------------
+
+
+def parse_gff_attrs(attr_txt: str) -> Dict[str, str]:
+    """Parse a GFF attribute column into a dict."""
+    out: Dict[str, str] = {}
+    for kv in attr_txt.split(';'):
+        if not kv or '=' not in kv:
+            continue
+        k, v = kv.split('=', 1)
+        out[k] = v
+    return out
 
 
 def write_fasta(path: Path, contigs: Dict[str, str]) -> Path:
@@ -115,48 +404,75 @@ def parse_fasta(txt: str) -> Dict[str, str]:
     """Return dict of header->sequence from FASTA text."""
     out: Dict[str, str] = {}
     header = None
-    chunks = []
+    chunks: List[str] = []
     for ln in txt.splitlines():
         if ln.startswith('>'):
             if header is not None:
                 out[header] = ''.join(chunks)
             header = ln[1:].strip()
             chunks = []
-        elif ln.strip():
+        else:
             chunks.append(ln.strip())
     if header is not None:
         out[header] = ''.join(chunks)
     return out
 
 
+# -----------------------------
+# Fixtures for extract submodule
+# -----------------------------
 @pytest.fixture
 def genome_plus(tmp_path) -> Path:
     """
-    Genome with a region supporting a two-exon '+' transcript:
+    Genome with three exons on '+' strand:
 
-    Exon1 (phase=1): chrA:101-107 = GATGAAA  -> trimmed first exon by 1 => ATGAAA
-    Exon2 (phase=1 but must be ignored): chrA:201-203 = TTT
-    Combined CDS (transcript 5'→3'): ATGAAA + TTT = ATGAAATTT -> 'MKF'
+    We want transcript CDS = 'ATG' + 'AAA' + 'TTT' -> 'MKF'
+
+    Exon1: chrA:101-103 = ATG (phase 0)
+    Exon2: chrA:201-203 = AAA (phase 0)
+    Exon3: chrA:301-303 = TTT (phase 0)
+
+    Combined: ATG + AAA + TTT => 'MKF'
     """
     seq = ['N'] * 1000
-    # exon1 GATGAAA at 1-based [101..107]
-    seq[100:107] = list('GATGAAA')
-    # exon2 TTT at [201..203]
-    seq[200:203] = list('TTT')
+    seq[100:103] = list('ATG')  # [101..103]
+    seq[200:203] = list('AAA')  # [201..203]
+    seq[300:303] = list('TTT')  # [301..303]
     chrA = ''.join(seq)
     return write_fasta(tmp_path / 'genome_plus.fa', {'chrA': chrA})
 
 
 @pytest.fixture
 def gff_plus_two_exons(tmp_path) -> Path:
-    """GFF3 for the '+' strand two-exon mRNA (with later exon phase=1 to ensure it's ignored)."""
+    """
+    Three CDS parts on '+' strand for a single transcript.
+    """
     gff = textwrap.dedent("""\
         ##gff-version 3
-        chrA\tmaxiprot\tmRNA\t101\t203\t.\t+\t.\tID=tx1
-        chrA\tmaxiprot\tCDS\t101\t107\t.\t+\t1\tParent=tx1;ID=cds_tx1
-        chrA\tmaxiprot\tCDS\t201\t203\t.\t+\t1\tParent=tx1;ID=cds_tx1
+        chrA\tmaxiprot\tmRNA\t101\t303\t.\t+\t.\tID=tx1
+        chrA\tmaxiprot\tCDS\t101\t103\t.\t+\t0\tParent=tx1;ID=cds_tx1
+        chrA\tmaxiprot\tCDS\t201\t203\t.\t+\t0\tParent=tx1;ID=cds_tx1
+        chrA\tmaxiprot\tCDS\t301\t303\t.\t+\t0\tParent=tx1;ID=cds_tx1
     """)
     p = tmp_path / 'tx1_plus.gff3'
+    p.write_text(gff, encoding='utf-8')
+    return p
+
+
+@pytest.fixture
+def gff_plus_cds_before_mrna(tmp_path) -> Path:
+    """
+    Same transcript as gff_plus_two_exons but with CDS lines BEFORE the mRNA
+    line (legal in GFF3; regression test for shell-mRNA merging).
+    """
+    gff = textwrap.dedent("""\
+        ##gff-version 3
+        chrA\tmaxiprot\tCDS\t101\t103\t.\t+\t0\tParent=tx1;ID=cds_tx1
+        chrA\tmaxiprot\tCDS\t201\t203\t.\t+\t0\tParent=tx1;ID=cds_tx1
+        chrA\tmaxiprot\tCDS\t301\t303\t.\t+\t0\tParent=tx1;ID=cds_tx1
+        chrA\tmaxiprot\tmRNA\t101\t303\t.\t+\t.\tID=tx1
+    """)
+    p = tmp_path / 'tx1_cds_first.gff3'
     p.write_text(gff, encoding='utf-8')
     return p
 
@@ -185,7 +501,9 @@ def genome_minus(tmp_path) -> Path:
 
 @pytest.fixture
 def gff_minus_two_exons(tmp_path) -> Path:
-    """GFF3 for '-' mRNA with two exons; phase only on the first in transcript order."""
+    """
+    Two CDS parts on '-' strand with phase on first exon (transcript order).
+    """
     gff = textwrap.dedent("""\
         ##gff-version 3
         chrB\tmaxiprot\tmRNA\t200\t303\t.\t-\t.\tID=tx2
@@ -248,7 +566,7 @@ def genome_two_on_one_contig(tmp_path) -> Path:
     seq = ['N'] * 1000
     # txA: [101..109] ATGAAAAAA (9 nt: ATG AAA AAA -> M K K)
     seq[100:109] = list('ATGAAAAAA')
-    # txB: [201..209] ATGAAAAAA (another)
+    # txB: [201..209] ATGAAAAAA (another on same contig)
     seq[200:209] = list('ATGAAAAAA')
     chrZ = ''.join(seq)
     return write_fasta(tmp_path / 'genome_two.fa', {'chrZ': chrZ})
@@ -271,14 +589,14 @@ def gff_two_mrnas_same_contig(tmp_path) -> Path:
 @pytest.fixture
 def gff_gene_minus(tmp_path) -> Path:
     """
-    A gene on '-' strand with a span to be reverse-complemented in gene mode.
-    Include one mRNA to be realistic, but gene extraction reads gene span only.
+    Gene on '-' strand, two CDS parts.
     """
     gff = textwrap.dedent("""\
         ##gff-version 3
-        chrG\tmaxiprot\tgene\t51\t59\t.\t-\t.\tID=geneG
-        chrG\tmaxiprot\tmRNA\t51\t59\t.\t-\t.\tID=txG;Parent=geneG
-        chrG\tmaxiprot\tCDS\t51\t59\t.\t-\t0\tParent=txG;ID=cds_txG
+        chrG\tmaxiprot\tgene\t51\t59\t.\t-\t.\tID=geneM
+        chrG\tmaxiprot\tmRNA\t51\t59\t.\t-\t.\tID=txGM;Parent=geneM
+        chrG\tmaxiprot\tCDS\t56\t59\t.\t-\t0\tParent=txGM;ID=cds_txGM
+        chrG\tmaxiprot\tCDS\t51\t53\t.\t-\t0\tParent=txGM;ID=cds_txGM
     """)
     p = tmp_path / 'gene_minus.gff3'
     p.write_text(gff, encoding='utf-8')

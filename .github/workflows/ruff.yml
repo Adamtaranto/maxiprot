@@ -1,33 +1,27 @@
-name: Ruff Formatting
+name: Ruff
+
 on: [pull_request]
+
+permissions:
+  contents: read
+
 jobs:
   ruff:
     if: ${{ github.actor != 'dependabot[bot]' }} # Do not run on commits created by dependabot
     runs-on: ubuntu-latest
-    permissions:
-      # Give the default GITHUB_TOKEN write permission to commit and push the changed files.
-      contents: write # Allows reading and writing repository contents (e.g., commits)
-      pull-requests: write # Allows reading and writing pull requests
     steps:
       - uses: actions/checkout@v7
+      # Keep `version` in sync with the ruff-pre-commit rev in
+      # .pre-commit-config.yaml so CI and local hooks agree.
+      - name: Check formatting
+        uses: astral-sh/ruff-action@v3
         with:
-          ref: ${{ github.sha }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: astral-sh/ruff-action@v3
-        with:
-          version: "latest"
+          version: "0.16.1"
           src: './src/maxiprot ./tests'
-          args: 'format'
-      - uses: astral-sh/ruff-action@v3
+          args: 'format --check --config=pyproject.toml'
+      - name: Lint
+        uses: astral-sh/ruff-action@v3
         with:
-          version: "latest"
+          version: "0.16.1"
           src: './src/maxiprot ./tests'
-          args: 'check'
-      - uses: isort/isort-action@v1
-        with:
-          configuration: "--settings-path=./pyproject.toml"
-          paths: "./src/maxiprot ./tests"
-      - uses: stefanzweifel/git-auto-commit-action@v7
-        id: auto-commit-action
-        with:
-          commit_message: 'Style fixes by Ruff'
+          args: 'check --no-fix --config=pyproject.toml'
