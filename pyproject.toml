@@ -154,8 +154,9 @@ exclude_files = [
 
 [tool.mypy]
 # Type hint strictness settings.
-# Must match `requires-python`; see the note on [tool.ruff] target-version.
-python_version = "3.10"
+# No pinned python_version: modern numpy stubs use PEP 695 `type` statements,
+# which mypy rejects when forced to target < 3.12. The 3.10 floor for our own
+# code is enforced by ruff's target-version and the CI test matrix.
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
