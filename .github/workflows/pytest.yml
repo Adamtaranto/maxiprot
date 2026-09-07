@@ -26,7 +26,8 @@ jobs:
     # use committed miniprot output under tests/data/). A future end-to-end
     # job could install miniprot from bioconda in a dedicated job.
     steps:
-      - uses: actions/checkout@v6
+      # Checkout the latest commit associated with the PR
+      - uses: actions/checkout@v7
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v7

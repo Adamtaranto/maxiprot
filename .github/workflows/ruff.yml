@@ -10,7 +10,7 @@ jobs:
     if: ${{ github.actor != 'dependabot[bot]' }} # Do not run on commits created by dependabot
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # Keep `version` in sync with the ruff-pre-commit rev in
       # .pre-commit-config.yaml so CI and local hooks agree.
       - name: Check formatting
