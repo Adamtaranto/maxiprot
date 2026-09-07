@@ -5,10 +5,12 @@ channels:
 dependencies:
   - miniprot
   - pip
-  - python=3.12
+  - python>=3.10
   - samtools
   - pip:
+      - biopython
+      - numpy
       - pandas
       - pyfaidx
-      - biopython
+      - rich
       - git+https://github.com/Adamtaranto/maxiprot.git

@@ -9,6 +9,12 @@ updates:
   # Enable version updates for GitHub Actions
   - package-ecosystem: "github-actions"
     # Check for workflow files in the .github/workflows directory
-    directory: "/" 
+    directory: "/"
     schedule:
       interval: "monthly" # Check for updates every month
+
+  # Enable version updates for Python dependencies (pyproject.toml)
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "monthly"
